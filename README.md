@@ -1,3 +1,9 @@
+> **This is an experimental fork** that offloads motion estimation to CUDA
+> and uses GPU search quality to prune mode decision — ~20% smaller files at
+> +4 VMAF and unchanged speed on NVIDIA GPUs without AV1 hardware encoders
+> (GTX 10/16, RTX 20/30). **See [README-GPU-ME.md](README-GPU-ME.md)** for
+> results, build flags, and caveats. Upstream README follows below.
+
 # Scalable Video Technology for AV1 (SVT-AV1 Encoder)
 
 The Scalable Video Technology for AV1 (SVT-AV1 Encoder) is an
