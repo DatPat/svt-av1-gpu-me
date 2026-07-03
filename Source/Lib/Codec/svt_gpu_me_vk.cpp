@@ -128,6 +128,14 @@ thread_local int t_laneIdx = NUM_LANES - 1;
         }                                                                             \
     } while (0)
 
+// Detached prefetch workers can race a queue submission against process
+// teardown, which wedges the Mali DDK's cleanup. Take the queue mutex for
+// good and drain the device before the process exits.
+void quiesceAtExit() {
+    g_ctx.queueMtx.lock(); // never released: blocks any further submits
+    if (g_ctx.dev) vkDeviceWaitIdle(g_ctx.dev);
+}
+
 void reportStats() {
     fprintf(stderr,
             "[GPU_ME] pairs: %llu  hits: %llu | gpu ms (worker/ME): %.0f/%.0f | ME cv-wait ms: %.0f "
@@ -347,6 +355,7 @@ bool initContext(int w, int h) {
         if (!L.hme0Set || !L.hme1Set || !L.fpSet) return false;
     }
     atexit(reportStats);
+    atexit(quiesceAtExit); // LIFO: runs before reportStats
     return true;
 }
 
