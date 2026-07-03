@@ -139,3 +139,26 @@ master builds (VMAF ~81) and ffmpeg's bundled libsvtav1 release (VMAF
 - Report the x86 lookahead corruption upstream with the reproduction
   recipe (this repo's base commit, 1080p50/720p50 input, >=180 frames,
   any preset, CRF 35, Windows/MSVC).
+
+## Addendum (step-3 follow-up): MD-prune hints evaluated — negative
+
+The recommended "cheaper GPU-assist" (mode-decision pruning hints without
+full GPU search) was evaluated on the board's clean testbed. Because the
+prune gate's inputs (`me_*_distortion`) are populated by the stock CPU ME
+anyway, the cheapest form needs no GPU at all; the gate was decoupled from
+the GPU module (`SVT_GPU_MD_PRUNE` now works on CPU-only builds) and swept
+at k=0/4/6 on both clips at presets 2/4/6:
+
+- fps: within +/-2% run-to-run noise in every cell
+- size: within 0.15% in every cell
+
+**The gated depth-removal boost has no measurable effect on the clean Arm
+testbed.** The desktop's previously-reported "+7.7% fps at flat VMAF" for
+this mechanism was measured on the corrupt-mode x86 encoder and should be
+considered an artifact until reproduced cleanly. Building a GPU hint
+kernel to feed this gate would inherit its ineffectiveness, so the
+"light GPU hints" variant is not worth implementing as formulated. If MD
+pruning on this encoder is to be pursued, it needs a different actuation
+point than `depth_removal_level` (e.g., direct depth-list surgery in
+`build_starting_cand_block_array` territory) and a BD-rate methodology on
+a trusted testbed first.
