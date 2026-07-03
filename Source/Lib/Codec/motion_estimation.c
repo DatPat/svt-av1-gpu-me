@@ -2997,6 +2997,15 @@ static EbErrorType svt_aom_motion_estimation_b64_inner(
                 }
             }
             if (gpu_slot >= 0) {
+                // Static-SB bypass: when the best 64x64 match on the nearest
+                // reference is the zero MV with near-noise SAD, the CPU's
+                // adaptive search is both nearly free and better tuned
+                // (avoids TPL/rate shifts from noise-fitted MVs on flat
+                // content). Inject GPU results only where there is motion.
+                const GpuMeB64Result* gr0 =
+                    &((const GpuMeB64Result*)me_ctx->gpu_me_slots[gpu_slot].bases[0])[b64_index];
+                bool gpu_static_sb = gr0->mv[0] == 0 && gr0->sad[0] < (64 * 64 * 4);
+                if (!gpu_static_sb) {
                 gpu_me_done = true;
                 int gi = 0;
                 for (uint32_t li = REF_LIST_0; li < num_of_list_to_search; ++li) {
@@ -3021,6 +3030,14 @@ static EbErrorType svt_aom_motion_estimation_b64_inner(
                 if (prune_ref && me_ctx->me_hme_prune_ctrls.enable_me_hme_ref_pruning) {
                     me_prune_ref(me_ctx);
                 }
+                // Mirror the CPU TF early-exit: near-perfect whole-block
+                // matches filter better with 64x64 zero-prediction than with
+                // per-sub-block MVs (which misregister noise on static SBs).
+                if (me_ctx->me_type == ME_MCTF &&
+                    me_ctx->search_results[0][0].hme_sad < me_ctx->tf_me_exit_th) {
+                    me_ctx->tf_use_pred_64x64_only_th = (uint8_t)~0;
+                }
+                } // !gpu_static_sb
             }
         }
     }

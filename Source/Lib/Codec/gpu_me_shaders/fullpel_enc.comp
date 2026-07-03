@@ -102,6 +102,10 @@ void main() {
                 uint sIdx = (sub8y + y) * 16u + (sub8x >> 2u);
                 sad += sad4(srcSh[sIdx], r0) + sad4(srcSh[sIdx + 1u], r1);
             }
+            // MV-cost regularization: bias toward short/zero vectors so the
+            // exhaustive search does not noise-fit on flat content (a few
+            // SAD points must not buy a random MV that costs bits to code).
+            sad += 4u * uint(abs(dx) + abs(dy));
             if (inRange) key8 = min(key8, (sad << 10) | posKey);
             sh8[grp][t64] = sad;
             barrier();
@@ -157,7 +161,11 @@ void main() {
             svt = 21u + svt16Idx(x8 >> 1u, y8 >> 1u) * 4u + (y8 & 1u) * 2u + (x8 & 1u);
         }
         uint outBase = resOff + blk * 170u;
-        results[outBase + svt] = k >> 10;    // sad[85] first
-        results[outBase + 85u + svt] = mv;   // then mv[85]
+        // Selection used the MV-cost penalty; report the raw SAD.
+        uint nSub8 = tid == 0u ? 64u : tid < 5u ? 16u : tid < 21u ? 4u : 1u;
+        int mdx = int(mv << 16) >> 16, mdy = int(mv) >> 16;
+        uint pen = 4u * nSub8 * uint(abs(mdx) + abs(mdy));
+        results[outBase + svt] = (k >> 10) - pen; // sad[85] first
+        results[outBase + 85u + svt] = mv;        // then mv[85]
     }
 }
