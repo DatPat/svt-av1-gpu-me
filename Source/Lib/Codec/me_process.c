@@ -91,7 +91,7 @@ EbErrorType svt_aom_motion_estimation_context_ctor(EbThreadContext* thread_ctx, 
  * to the prediction structure pattern.  The Motion Analysis process is multithreaded,
  * so pictures can be processed out of order as long as all inputs are available.
  ************************************************/
-EbErrorType svt_aom_motion_estimation_kernel_iter(void* context) {
+static EbErrorType svt_aom_motion_estimation_kernel_iter_inner(void* context) {
     MotionEstimationContext_t* me_context_ptr = (MotionEstimationContext_t*)context;
 
     EbObjectWrapper* in_results_wrapper_ptr;
@@ -320,3 +320,6 @@ void* svt_aom_motion_estimation_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(MeProcessInclTf, svt_aom_motion_estimation_kernel_iter_inner, svt_aom_motion_estimation_kernel_iter)

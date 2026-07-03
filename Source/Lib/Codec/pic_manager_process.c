@@ -367,7 +367,7 @@ void superres_setup_child_pcs(SequenceControlSet* entry_scs_ptr, PictureParentCo
  *  Picture Control Set with fully available Reference List
  *
  ***************************************************************************************************/
-EbErrorType svt_aom_picture_manager_kernel_iter(void* context) {
+static EbErrorType svt_aom_picture_manager_kernel_iter_inner(void* context) {
     PictureManagerContext* context_ptr = (PictureManagerContext*)context;
 
     PictureParentControlSet* pcs;
@@ -938,3 +938,6 @@ void* svt_aom_picture_manager_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(PictureManager, svt_aom_picture_manager_kernel_iter_inner, svt_aom_picture_manager_kernel_iter)

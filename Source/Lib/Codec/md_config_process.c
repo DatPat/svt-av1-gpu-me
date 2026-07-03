@@ -897,7 +897,7 @@ static bool me_based_cdef_skip(PictureControlSet* pcs) {
  *  Initializations for various flags and variables
  *
  ********************************************************************************/
-EbErrorType svt_aom_mode_decision_configuration_kernel_iter(void* context) {
+static EbErrorType svt_aom_mode_decision_configuration_kernel_iter_inner(void* context) {
     // Context & SCS & PCS
     ModeDecisionConfigurationContext* context_ptr = (ModeDecisionConfigurationContext*)context;
     // Input
@@ -1127,3 +1127,6 @@ void* svt_aom_mode_decision_configuration_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(MdConfig, svt_aom_mode_decision_configuration_kernel_iter_inner, svt_aom_mode_decision_configuration_kernel_iter)

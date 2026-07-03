@@ -16,6 +16,9 @@
 #include <limits.h>
 
 #include "pd_process.h"
+#ifdef SVT_ENABLE_GPU_ME
+#include "svt_gpu_me.h"
+#endif
 #include "definitions.h"
 #include "enc_handle.h"
 #include "pcs.h"
@@ -4682,6 +4685,35 @@ static void mctf_frame(SequenceControlSet* scs, PictureParentControlSet* pcs, Pi
     if (pcs->tf_ctrls.enabled) {
         derive_tf_window_params(scs, scs->enc_ctx, pcs, pd_ctx);
         pcs->temp_filt_prep_done = 0;
+#ifdef SVT_ENABLE_GPU_ME
+        // Prefetch TF's motion searches (center vs each window neighbor) so
+        // the TF tasks below find them cached. Generation = center+1 keys
+        // pre-filter content apart from later open-loop ME on the same pics.
+        if (svt_gpu_me_enabled()) {
+            GpuMeRef tf_refs[GPU_ME_MAX_REFS];
+            int      tf_n    = 0;
+            int      tf_ctr  = pcs->past_altref_nframes;
+            int      tf_tot  = pcs->past_altref_nframes + pcs->future_altref_nframes + 1;
+            for (int i = 0; i < tf_tot && tf_n < GPU_ME_MAX_REFS; i++) {
+                if (i == tf_ctr || pcs->temp_filt_pcs_list[i] == NULL) continue;
+                EbPaReferenceObject* tf_ro = (EbPaReferenceObject*)
+                                                 pcs->temp_filt_pcs_list[i]->pa_ref_pic_wrapper->object_ptr;
+                tf_refs[tf_n].y       = tf_ro->input_padded_pic->y_buffer;
+                tf_refs[tf_n].stride  = tf_ro->input_padded_pic->y_stride;
+                tf_refs[tf_n].pic_num = tf_ro->picture_number;
+                tf_n++;
+            }
+            if (tf_n)
+                svt_gpu_me_prefetch(pcs->enhanced_pic->y_buffer,
+                                    pcs->enhanced_pic->y_stride,
+                                    pcs->picture_number,
+                                    pcs->picture_number + 1,
+                                    tf_refs,
+                                    tf_n,
+                                    pcs->aligned_width,
+                                    pcs->aligned_height);
+        }
+#endif
         pcs->tf_tot_horz_blks = pcs->tf_tot_vert_blks = 0;
 
         // Start Filtering in ME processes
@@ -4860,6 +4892,33 @@ static void send_picture_out(SequenceControlSet* scs, PictureParentControlSet* p
             svt_block_on_semaphore(scs->ref_buffer_available_semaphore);
     }
 
+#ifdef SVT_ENABLE_GPU_ME
+    // Kick the GPU ME for this picture before its ME tasks are posted, so
+    // results are already cached when the ME stage requests them.
+    if (svt_gpu_me_enabled() && !pcs->frame_superres_enabled && !pcs->frame_resize_enabled) {
+        GpuMeRef gpu_refs[GPU_ME_MAX_REFS];
+        int      gpu_num_refs = 0;
+        uint8_t  ref_counts[2] = {pcs->ref_list0_count_try, pcs->ref_list1_count_try};
+        for (int li = 0; li < MAX_NUM_OF_REF_PIC_LIST; li++) {
+            for (int ri = 0; ri < ref_counts[li] && gpu_num_refs < GPU_ME_MAX_REFS; ri++) {
+                EbPaReferenceObject* ref_object = (EbPaReferenceObject*)pcs->ref_pa_pic_ptr_array[li][ri]->object_ptr;
+                gpu_refs[gpu_num_refs].y        = ref_object->input_padded_pic->y_buffer;
+                gpu_refs[gpu_num_refs].stride   = ref_object->input_padded_pic->y_stride;
+                gpu_refs[gpu_num_refs].pic_num  = ref_object->picture_number;
+                gpu_num_refs++;
+            }
+        }
+        if (gpu_num_refs)
+            svt_gpu_me_prefetch(pcs->enhanced_pic->y_buffer,
+                                pcs->enhanced_pic->y_stride,
+                                pcs->picture_number,
+                                0,
+                                gpu_refs,
+                                gpu_num_refs,
+                                pcs->aligned_width,
+                                pcs->aligned_height);
+    }
+#endif
     for (uint32_t segment_index = 0; segment_index < pcs->me_segments_total_count; ++segment_index) {
         // Get Empty Results Object
         svt_get_empty_object(ctx->picture_decision_results_output_fifo_ptr, &out_results_wrapper);
@@ -5976,7 +6035,7 @@ static uint32_t calc_ahd_pd(SequenceControlSet* scs, PictureParentControlSet* pc
 *     Pictures is used. The intention here is that any combination of Intra Flag and Scene
 *     Change flag can be coded.
 ***************************************************************************************************/
-EbErrorType svt_aom_picture_decision_kernel_iter(void* context) {
+static EbErrorType svt_aom_picture_decision_kernel_iter_inner(void* context) {
     PictureDecisionContext* ctx = (PictureDecisionContext*)context;
 
     PictureParentControlSet* pcs;
@@ -6426,3 +6485,6 @@ void* svt_aom_picture_decision_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(PictureDecision, svt_aom_picture_decision_kernel_iter_inner, svt_aom_picture_decision_kernel_iter)

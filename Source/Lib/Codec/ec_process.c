@@ -136,7 +136,7 @@ static void reset_entropy_coding_picture(EntropyCodingContext* ctx, PictureContr
  *  Bitstream for each block
  *
  ********************************************************************************/
-EbErrorType svt_aom_entropy_coding_kernel_iter(void* context) {
+static EbErrorType svt_aom_entropy_coding_kernel_iter_inner(void* context) {
     EntropyCodingContext* context_ptr = (EntropyCodingContext*)context;
 
     // Input
@@ -288,3 +288,6 @@ void* svt_aom_entropy_coding_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(EntropyCoding, svt_aom_entropy_coding_kernel_iter_inner, svt_aom_entropy_coding_kernel_iter)

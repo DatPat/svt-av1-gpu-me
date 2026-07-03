@@ -447,7 +447,7 @@ void update_firstpass_stats(PictureParentControlSet* pcs, const int frame_number
 void svt_av1_end_first_pass(PictureParentControlSet* pcs);
 
 /* Realloc when bitstream pointer size is not enough to write data of size sz */
-EbErrorType svt_aom_packetization_kernel_iter(void* context) {
+static EbErrorType svt_aom_packetization_kernel_iter_inner(void* context) {
     // Context
     PacketizationContext* context_ptr = (PacketizationContext*)context;
 
@@ -951,3 +951,6 @@ void* svt_aom_packetization_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(Packetization, svt_aom_packetization_kernel_iter_inner, svt_aom_packetization_kernel_iter)

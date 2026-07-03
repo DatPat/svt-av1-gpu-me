@@ -258,7 +258,7 @@ static void copy_statistics_to_ref_obj_ect(PictureControlSet* pcs, SequenceContr
 /******************************************************
  * Rest Kernel
  ******************************************************/
-EbErrorType svt_aom_rest_kernel_iter(void* context) {
+static EbErrorType svt_aom_rest_kernel_iter_inner(void* context) {
     RestContext* context_ptr = (RestContext*)context;
 
     // Get Cdef Results
@@ -510,3 +510,6 @@ void* svt_aom_rest_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(RestorationSearch, svt_aom_rest_kernel_iter_inner, svt_aom_rest_kernel_iter)

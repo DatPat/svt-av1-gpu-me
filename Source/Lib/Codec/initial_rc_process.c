@@ -695,7 +695,7 @@ static void set_1pvbr_param(PictureParentControlSet* pcs) {
  *  In the future we might decide to move it to Motion Analysis Process.
  *
  ********************************************************************************/
-EbErrorType svt_aom_initial_rate_control_kernel_iter(void* context) {
+static EbErrorType svt_aom_initial_rate_control_kernel_iter_inner(void* context) {
     InitialRateControlContext* context_ptr = (InitialRateControlContext*)context;
 
     EbObjectWrapper* in_results_wrapper_ptr;
@@ -858,3 +858,6 @@ void* svt_aom_initial_rate_control_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(InitialRateControl, svt_aom_initial_rate_control_kernel_iter_inner, svt_aom_initial_rate_control_kernel_iter)

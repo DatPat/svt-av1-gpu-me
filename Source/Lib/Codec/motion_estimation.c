@@ -17,6 +17,9 @@
 #include "pcs.h"
 #include "sequence_control_set.h"
 #include "motion_estimation.h"
+#ifdef SVT_ENABLE_GPU_ME
+#include "svt_gpu_me.h"
+#endif
 #include "utility.h"
 
 #include "compute_sad.h"
@@ -2902,7 +2905,7 @@ static bool me_static_b64_bypass(MeContext* me_ctx, uint32_t b64_origin_x, uint3
 }
 #endif
 
-EbErrorType svt_aom_motion_estimation_b64(
+static EbErrorType svt_aom_motion_estimation_b64_inner(
     PictureParentControlSet* pcs, // input parameter, Picture Control Set Ptr
     uint32_t                 b64_index, // input parameter, SB Index
     uint32_t                 b64_origin_x, // input parameter, SB Origin X
@@ -2933,6 +2936,96 @@ EbErrorType svt_aom_motion_estimation_b64(
     // processed b64, which can drive an out-of-bounds reference fetch in inter prediction
     // (observed as a SIGSEGV in svt_av1_convolve_2d_copy_sr_neon on edge SBs at >=1080p RTC).
     init_me_hme_data(me_ctx);
+#ifdef SVT_ENABLE_GPU_ME
+    // GPU open-loop ME offload: replace HME + integer search with CUDA
+    // results injected into the p_sb_best arrays; the candidate packing
+    // below consumes them unchanged. Falls back to the CPU path on any
+    // GPU-side failure.
+    bool gpu_me_done = false;
+    if (svt_gpu_me_enabled()) {
+        // Generation key: 0 for open-loop ME (post-TF pixel content);
+        // center_pic_num+1 for temporal-filtering ME, whose source/reference
+        // pixels predate in-place filtering and must not share cache entries.
+        const uint64_t gpu_gen = me_ctx->me_type == ME_MCTF ? pcs->picture_number + 1 : 0;
+        GpuMeRef       gpu_refs[GPU_ME_MAX_REFS];
+        int            gpu_num_refs = 0;
+        for (uint32_t li = REF_LIST_0; li < num_of_list_to_search; ++li) {
+            for (uint8_t ri = 0; ri < me_ctx->num_of_ref_pic_to_search[li] && gpu_num_refs < GPU_ME_MAX_REFS; ++ri) {
+                uint16_t             gpu_dist;
+                EbPictureBufferDesc* gpu_ref_pic = get_me_reference(
+                    pcs, me_ctx, (uint8_t)li, ri, 2, &gpu_dist, input_ptr->width, input_ptr->height);
+                gpu_refs[gpu_num_refs].y       = gpu_ref_pic->y_buffer;
+                gpu_refs[gpu_num_refs].stride  = gpu_ref_pic->y_stride;
+                gpu_refs[gpu_num_refs].pic_num = me_ctx->me_ds_ref_array[li][ri].picture_number;
+                gpu_num_refs++;
+            }
+        }
+        if (gpu_num_refs) {
+            // Per-picture pinned handle, cached in the ME context so the
+            // per-b64 path below is lock-free pointer arithmetic.
+            int gpu_slot = -1;
+            for (int sl = 0; sl < 8; sl++) {
+                if (me_ctx->gpu_me_slots[sl].handle && me_ctx->gpu_me_slots[sl].pic == pcs->picture_number &&
+                    me_ctx->gpu_me_slots[sl].gen == gpu_gen && me_ctx->gpu_me_slots[sl].ref0 == gpu_refs[0].pic_num &&
+                    me_ctx->gpu_me_slots[sl].nrefs == gpu_num_refs) {
+                    gpu_slot = sl;
+                    break;
+                }
+            }
+            if (gpu_slot < 0) {
+                const GpuMeB64Result* gpu_bases[GPU_ME_MAX_REFS];
+                void*                 gpu_handle = svt_gpu_me_acquire(input_ptr->y_buffer,
+                                                      input_ptr->y_stride,
+                                                      pcs->picture_number,
+                                                      gpu_gen,
+                                                      gpu_refs,
+                                                      gpu_num_refs,
+                                                      pcs->aligned_width,
+                                                      pcs->aligned_height,
+                                                      gpu_bases);
+                if (gpu_handle) {
+                    gpu_slot                 = me_ctx->gpu_me_slot_next;
+                    me_ctx->gpu_me_slot_next = (me_ctx->gpu_me_slot_next + 1) & 7;
+                    if (me_ctx->gpu_me_slots[gpu_slot].handle)
+                        svt_gpu_me_release(me_ctx->gpu_me_slots[gpu_slot].handle);
+                    me_ctx->gpu_me_slots[gpu_slot].pic    = pcs->picture_number;
+                    me_ctx->gpu_me_slots[gpu_slot].gen    = gpu_gen;
+                    me_ctx->gpu_me_slots[gpu_slot].ref0   = gpu_refs[0].pic_num;
+                    me_ctx->gpu_me_slots[gpu_slot].nrefs  = gpu_num_refs;
+                    me_ctx->gpu_me_slots[gpu_slot].handle = gpu_handle;
+                    for (int i = 0; i < gpu_num_refs; i++) me_ctx->gpu_me_slots[gpu_slot].bases[i] = gpu_bases[i];
+                }
+            }
+            if (gpu_slot >= 0) {
+                gpu_me_done = true;
+                int gi = 0;
+                for (uint32_t li = REF_LIST_0; li < num_of_list_to_search; ++li) {
+                    for (uint8_t ri = 0; ri < me_ctx->num_of_ref_pic_to_search[li] && gi < gpu_num_refs;
+                         ++ri, ++gi) {
+                        const GpuMeB64Result* gr =
+                            &((const GpuMeB64Result*)me_ctx->gpu_me_slots[gpu_slot].bases[gi])[b64_index];
+                        memcpy(me_ctx->p_sb_best_sad[li][ri], gr->sad, sizeof(gr->sad));
+                        memcpy(me_ctx->p_sb_best_mv[li][ri], gr->mv, sizeof(gr->mv));
+                        me_ctx->search_results[li][ri].do_ref  = 1;
+                        me_ctx->search_results[li][ri].hme_sad = gr->sad[0];
+                        me_ctx->p_best_sad_64x64 = &me_ctx->p_sb_best_sad[li][ri][ME_TIER_ZERO_PU_64x64];
+                        me_ctx->p_best_sad_32x32 = &me_ctx->p_sb_best_sad[li][ri][ME_TIER_ZERO_PU_32x32_0];
+                        me_ctx->p_best_sad_16x16 = &me_ctx->p_sb_best_sad[li][ri][ME_TIER_ZERO_PU_16x16_0];
+                        me_ctx->p_best_sad_8x8   = &me_ctx->p_sb_best_sad[li][ri][ME_TIER_ZERO_PU_8x8_0];
+                        me_ctx->p_best_mv64x64   = &me_ctx->p_sb_best_mv[li][ri][ME_TIER_ZERO_PU_64x64];
+                        me_ctx->p_best_mv32x32   = &me_ctx->p_sb_best_mv[li][ri][ME_TIER_ZERO_PU_32x32_0];
+                        me_ctx->p_best_mv16x16   = &me_ctx->p_sb_best_mv[li][ri][ME_TIER_ZERO_PU_16x16_0];
+                        me_ctx->p_best_mv8x8     = &me_ctx->p_sb_best_mv[li][ri][ME_TIER_ZERO_PU_8x8_0];
+                    }
+                }
+                if (prune_ref && me_ctx->me_hme_prune_ctrls.enable_me_hme_ref_pruning) {
+                    me_prune_ref(me_ctx);
+                }
+            }
+        }
+    }
+    if (!gpu_me_done) {
+#endif
 #if OPT_ME_STATIC_B64
     if (!me_static_b64_bypass(me_ctx, b64_origin_x, b64_origin_y)) {
 #endif
@@ -2956,6 +3049,9 @@ EbErrorType svt_aom_motion_estimation_b64(
         }
 #if OPT_ME_STATIC_B64
     }
+#endif
+#ifdef SVT_ENABLE_GPU_ME
+    } // !gpu_me_done
 #endif
 
     if (me_ctx->me_type != ME_MCTF) {
@@ -2981,4 +3077,29 @@ EbErrorType svt_aom_motion_estimation_b64(
         }
     }
     return return_error;
+}
+
+// ---- Local experiment: measure CPU cycles spent in open-loop ME ------------
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+static volatile LONG64 g_me_cycles;
+static volatile LONG   g_me_report_registered;
+static void me_cycles_report(void) {
+    ULONG64 proc_cycles = 0;
+    QueryProcessCycleTime(GetCurrentProcess(), &proc_cycles);
+    fprintf(stderr,
+            "[ME_TIMER] open-loop ME cycles: %lld  process cycles: %llu  share: %.1f%%\n",
+            (long long)g_me_cycles, proc_cycles, 100.0 * (double)g_me_cycles / (double)proc_cycles);
+}
+EbErrorType svt_aom_motion_estimation_b64(PictureParentControlSet* pcs, uint32_t b64_index, uint32_t b64_origin_x,
+                                          uint32_t b64_origin_y, MeContext* me_ctx, EbPictureBufferDesc* input_ptr) {
+    if (!InterlockedCompareExchange(&g_me_report_registered, 1, 0))
+        atexit(me_cycles_report);
+    ULONG64 c0 = 0, c1 = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c0);
+    EbErrorType r = svt_aom_motion_estimation_b64_inner(pcs, b64_index, b64_origin_x, b64_origin_y, me_ctx, input_ptr);
+    QueryThreadCycleTime(GetCurrentThread(), &c1);
+    InterlockedExchangeAdd64(&g_me_cycles, (LONG64)(c1 - c0));
+    return r;
 }

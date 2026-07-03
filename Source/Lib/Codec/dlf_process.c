@@ -48,7 +48,7 @@ EbErrorType svt_aom_dlf_context_ctor(EbThreadContext* thread_ctx, const EbEncHan
 /******************************************************
  * Dlf Kernel
  ******************************************************/
-EbErrorType svt_aom_dlf_kernel_iter(void* context) {
+static EbErrorType svt_aom_dlf_kernel_iter_inner(void* context) {
     // Context & SCS & PCS
     DlfContext*         context_ptr = (DlfContext*)context;
     PictureControlSet*  pcs;
@@ -178,3 +178,6 @@ void* svt_aom_dlf_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(DeblockFilter, svt_aom_dlf_kernel_iter_inner, svt_aom_dlf_kernel_iter)

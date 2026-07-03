@@ -642,7 +642,7 @@ static void cdef_seg_search(PictureControlSet* pcs, SequenceControlSet* scs, uin
 /******************************************************
  * CDEF Kernel
  ******************************************************/
-EbErrorType svt_aom_cdef_kernel_iter(void* context) {
+static EbErrorType svt_aom_cdef_kernel_iter_inner(void* context) {
     // Context & SCS & PCS
     CdefContext*        context_ptr = (CdefContext*)context;
     PictureControlSet*  pcs;
@@ -782,3 +782,6 @@ void* svt_aom_cdef_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(CdefSearch, svt_aom_cdef_kernel_iter_inner, svt_aom_cdef_kernel_iter)

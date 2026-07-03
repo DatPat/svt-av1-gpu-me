@@ -483,6 +483,16 @@ typedef struct MeContext {
     uint32_t b64_height;
     uint8_t  performed_phme[MAX_NUM_OF_REF_PIC_LIST][REF_LIST_MAX_DEPTH][2];
     uint32_t prev_me_stage_based_exit_th;
+#ifdef SVT_ENABLE_GPU_ME
+    // Per-picture GPU-ME handle cache: per-b64 injection then needs no locks.
+    struct {
+        uint64_t    pic, gen, ref0;
+        int32_t     nrefs;
+        void*       handle;
+        const void* bases[8];
+    } gpu_me_slots[8];
+    uint32_t gpu_me_slot_next;
+#endif
 } MeContext;
 
 typedef uint64_t (*EB_ME_DISTORTION_FUNC)(uint8_t* src, uint32_t src_stride, uint8_t* ref, uint32_t ref_stride,

@@ -809,7 +809,7 @@ static void rc_process_packetization_feedback(PictureParentControlSet* ppcs,
     svt_release_object(rc_tasks->pcs_wrapper);
 }
 
-EbErrorType svt_aom_rate_control_kernel_iter(void* context) {
+static EbErrorType svt_aom_rate_control_kernel_iter_inner(void* context) {
     RateControlContext* context_ptr = (RateControlContext*)context;
 
     SequenceControlSet*      scs  = NULL;
@@ -923,3 +923,6 @@ void* svt_aom_rate_control_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(RateControl, svt_aom_rate_control_kernel_iter_inner, svt_aom_rate_control_kernel_iter)

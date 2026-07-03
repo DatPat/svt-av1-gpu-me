@@ -13,9 +13,19 @@
 #include <string.h>
 
 #include "me_context.h"
+#ifdef SVT_ENABLE_GPU_ME
+#include "svt_gpu_me.h"
+#endif
 #include "utility.h"
 
 static void me_context_dctor(EbPtr p) {
+#ifdef SVT_ENABLE_GPU_ME
+    {
+        MeContext* obj_gpu = (MeContext*)p;
+        for (int s = 0; s < 8; s++)
+            if (obj_gpu->gpu_me_slots[s].handle) svt_gpu_me_release(obj_gpu->gpu_me_slots[s].handle);
+    }
+#endif
     MeContext* obj = (MeContext*)p;
 
     EB_FREE_ARRAY(obj->p_eight_pos_sad16x16);
@@ -23,6 +33,10 @@ static void me_context_dctor(EbPtr p) {
 
 EbErrorType svt_aom_me_context_ctor(MeContext* object_ptr) {
     object_ptr->dctor = me_context_dctor;
+#ifdef SVT_ENABLE_GPU_ME
+    memset(object_ptr->gpu_me_slots, 0, sizeof(object_ptr->gpu_me_slots));
+    object_ptr->gpu_me_slot_next = 0;
+#endif
 
     EB_MALLOC_ARRAY(object_ptr->p_eight_pos_sad16x16,
                     8 * 16); //16= 16 16x16 blocks in a SB.       8=8search points

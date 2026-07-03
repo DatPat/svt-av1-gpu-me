@@ -326,3 +326,15 @@ else()
     # Always define SVT_AV1_NVTX so `#if SVT_AV1_NVTX` is well-formed under -Wundef.
     target_compile_definitions(CODEC PRIVATE SVT_AV1_NVTX=0)
 endif()
+
+# ---- Experimental: CUDA GPU open-loop ME offload (SVT_GPU_ME=ON) ----------
+option(SVT_GPU_ME "Enable CUDA GPU open-loop ME offload (runtime env SVT_GPU_ME=1)" OFF)
+if(SVT_GPU_ME)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_library(GPU_ME_LIB STATIC svt_gpu_me.cu)
+    set_target_properties(GPU_ME_LIB PROPERTIES CUDA_ARCHITECTURES native)
+    target_compile_options(GPU_ME_LIB PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+    target_compile_definitions(CODEC PRIVATE SVT_ENABLE_GPU_ME=1)
+    target_link_libraries(SvtAv1Enc PUBLIC "$<BUILD_INTERFACE:GPU_ME_LIB>" "$<BUILD_INTERFACE:CUDA::cudart_static>")
+endif()

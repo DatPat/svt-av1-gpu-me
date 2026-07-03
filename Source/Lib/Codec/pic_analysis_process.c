@@ -1992,7 +1992,7 @@ static void vmaf_preprocess_frame(PictureAnalysisContext* pa_ctx, PictureParentC
  *then used to compute statistics
  *
  ********************************************************************************/
-EbErrorType svt_aom_picture_analysis_kernel_iter(void* context) {
+static EbErrorType svt_aom_picture_analysis_kernel_iter_inner(void* context) {
     PictureAnalysisContext*  pa_ctx = (PictureAnalysisContext*)context;
     PictureParentControlSet* pcs;
 
@@ -2147,3 +2147,6 @@ void* svt_aom_picture_analysis_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(PictureAnalysis, svt_aom_picture_analysis_kernel_iter_inner, svt_aom_picture_analysis_kernel_iter)

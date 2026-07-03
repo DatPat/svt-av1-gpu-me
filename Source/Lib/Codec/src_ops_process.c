@@ -523,9 +523,37 @@ static void tpl_subpel_search(SequenceControlSet* scs, PictureParentControlSet* 
     best_mv->as_int = best_sp_mv.as_int;
 }
 
+// ---- Local experiment: measure CPU cycles spent in TPL dispenser -----------
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+static volatile LONG64 g_tpl_cycles;
+static volatile LONG   g_tpl_report_registered;
+static void tpl_cycles_report(void) {
+    ULONG64 proc_cycles = 0;
+    QueryProcessCycleTime(GetCurrentProcess(), &proc_cycles);
+    fprintf(stderr, "[TPL_TIMER] TPL dispenser cycles: %lld  process cycles: %llu  share: %.1f%%\n",
+            (long long)g_tpl_cycles, proc_cycles, 100.0 * (double)g_tpl_cycles / (double)proc_cycles);
+}
+static void tpl_mc_flow_dispenser_sb_generic_inner(EncodeContext* enc_ctx, SequenceControlSet* scs,
+                                                   PictureParentControlSet* pcs, int32_t frame_idx,
+                                                   uint32_t sb_index, int32_t qIndex,
+                                                   uint8_t dispenser_search_level);
 static void tpl_mc_flow_dispenser_sb_generic(EncodeContext* enc_ctx, SequenceControlSet* scs,
                                              PictureParentControlSet* pcs, int32_t frame_idx, uint32_t sb_index,
                                              int32_t qIndex, uint8_t dispenser_search_level) {
+    if (!InterlockedCompareExchange(&g_tpl_report_registered, 1, 0))
+        atexit(tpl_cycles_report);
+    ULONG64 c0 = 0, c1 = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c0);
+    tpl_mc_flow_dispenser_sb_generic_inner(enc_ctx, scs, pcs, frame_idx, sb_index, qIndex, dispenser_search_level);
+    QueryThreadCycleTime(GetCurrentThread(), &c1);
+    InterlockedExchangeAdd64(&g_tpl_cycles, (LONG64)(c1 - c0));
+}
+static void tpl_mc_flow_dispenser_sb_generic_inner(EncodeContext* enc_ctx, SequenceControlSet* scs,
+                                                   PictureParentControlSet* pcs, int32_t frame_idx,
+                                                   uint32_t sb_index, int32_t qIndex,
+                                                   uint8_t dispenser_search_level) {
     uint32_t size      = size_array[dispenser_search_level];
     uint32_t blk_start = blk_start_array[dispenser_search_level];
     uint32_t blk_end   = blk_end_array[dispenser_search_level];
@@ -1988,7 +2016,7 @@ static EbErrorType tpl_mc_flow(EncodeContext* enc_ctx, SequenceControlSet* scs, 
    process one picture of TPL group
 */
 
-EbErrorType svt_aom_tpl_disp_kernel_iter(void* context) {
+static EbErrorType svt_aom_tpl_disp_kernel_iter_inner(void* context) {
     TplDispenserContext* context_ptr = (TplDispenserContext*)context;
     EbObjectWrapper*     in_results_wrapper_ptr;
     TplDispResults*      in_results_ptr;
@@ -2227,7 +2255,7 @@ static void aom_av1_set_mb_ssim_rdmult_scaling(PictureParentControlSet* pcs) {
  * Source-based operations process involves a number of analysis algorithms
  * to identify spatiotemporal characteristics of the input pictures.
  ************************************************/
-EbErrorType svt_aom_source_based_operations_kernel_iter(void* context) {
+static EbErrorType svt_aom_source_based_operations_kernel_iter_inner(void* context) {
     SourceBasedOperationsContext* context_ptr = (SourceBasedOperationsContext*)context;
     EbObjectWrapper*              in_results_wrapper_ptr;
 
@@ -2281,3 +2309,9 @@ void* svt_aom_source_based_operations_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(TplDispatch, svt_aom_tpl_disp_kernel_iter_inner, svt_aom_tpl_disp_kernel_iter)
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(SourceBasedOps, svt_aom_source_based_operations_kernel_iter_inner, svt_aom_source_based_operations_kernel_iter)

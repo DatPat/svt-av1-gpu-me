@@ -2842,7 +2842,7 @@ static NOINLINE void avg_cdf_symbols(FRAME_CONTEXT* ctx_left, FRAME_CONTEXT* ctx
  *appropriate syntax elements to be sent to the entropy coding engine
  *
  ********************************************************************************/
-EbErrorType svt_aom_mode_decision_kernel_iter(void* context) {
+static EbErrorType svt_aom_mode_decision_kernel_iter_inner(void* context) {
     // Context & SCS & PCS
     EncDecContext* ed_ctx = (EncDecContext*)context;
 
@@ -3540,3 +3540,6 @@ void* svt_aom_mode_decision_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(ModeDecisionEncDec, svt_aom_mode_decision_kernel_iter_inner, svt_aom_mode_decision_kernel_iter)

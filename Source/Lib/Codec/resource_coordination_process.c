@@ -995,7 +995,7 @@ static void set_eos_terminating_signals(PictureParentControlSet* pcs) {
  *picture type ...
  *
  ********************************************************************************/
-EbErrorType svt_aom_resource_coordination_kernel_iter(void* context) {
+static EbErrorType svt_aom_resource_coordination_kernel_iter_inner(void* context) {
     ResourceCoordinationContext* context_ptr = (ResourceCoordinationContext*)context;
 
     EbObjectWrapper* pcs_wrapper;
@@ -1415,3 +1415,6 @@ void* svt_aom_resource_coordination_kernel(void* input_ptr) {
     }
     return NULL;
 }
+
+#include "stage_timer_local.h"
+DEFINE_STAGE_TIMER(ResourceCoord, svt_aom_resource_coordination_kernel_iter_inner, svt_aom_resource_coordination_kernel_iter)
