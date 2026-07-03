@@ -16,6 +16,7 @@
 #include "aom_dsp_rtcd.h"
 #include "pcs.h"
 #include "sequence_control_set.h"
+#include <stdlib.h>
 #include "motion_estimation.h"
 #ifdef SVT_ENABLE_GPU_ME
 #include "svt_gpu_me.h"
@@ -2942,7 +2943,14 @@ static EbErrorType svt_aom_motion_estimation_b64_inner(
     // below consumes them unchanged. Falls back to the CPU path on any
     // GPU-side failure.
     bool gpu_me_done = false;
-    if (svt_gpu_me_enabled()) {
+    // SVT_GPU_ME_TF=0 keeps temporal filtering's motion search on the CPU
+    // (open-loop ME still offloaded) for isolating the two effects.
+    static int gpu_tf_enabled = -1;
+    if (gpu_tf_enabled < 0) {
+        const char* tf_env = getenv("SVT_GPU_ME_TF");
+        gpu_tf_enabled     = tf_env ? atoi(tf_env) : 1;
+    }
+    if (svt_gpu_me_enabled() && (me_ctx->me_type != ME_MCTF || gpu_tf_enabled)) {
         // Generation key: 0 for open-loop ME (post-TF pixel content);
         // center_pic_num+1 for temporal-filtering ME, whose source/reference
         // pixels predate in-place filtering and must not share cache entries.
