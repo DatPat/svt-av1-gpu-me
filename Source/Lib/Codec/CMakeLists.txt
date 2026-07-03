@@ -338,3 +338,29 @@ if(SVT_GPU_ME)
     target_compile_definitions(CODEC PRIVATE SVT_ENABLE_GPU_ME=1)
     target_link_libraries(SvtAv1Enc PUBLIC "$<BUILD_INTERFACE:GPU_ME_LIB>" "$<BUILD_INTERFACE:CUDA::cudart_static>")
 endif()
+
+# ---- Experimental: Vulkan GPU open-loop ME offload (SVT_GPU_ME_VULKAN=ON) --
+# Same runtime behavior and env switches as the CUDA backend, for integrated
+# GPUs (Mali, etc.). Mutually exclusive with SVT_GPU_ME.
+option(SVT_GPU_ME_VULKAN "Enable Vulkan GPU open-loop ME offload (runtime env SVT_GPU_ME=1)" OFF)
+if(SVT_GPU_ME_VULKAN)
+    enable_language(CXX)
+    find_package(Vulkan REQUIRED)
+    find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
+    set(GPU_ME_SHADER_HDRS "")
+    foreach(sh downsample_enc hme0_enc hme1_enc fullpel_enc)
+        add_custom_command(
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${sh}.spv.h
+            COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_CURRENT_SOURCE_DIR}/gpu_me_shaders/${sh}.comp --vn ${sh}_spv
+                    -o ${CMAKE_CURRENT_BINARY_DIR}/${sh}.spv.h
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gpu_me_shaders/${sh}.comp
+            COMMENT "Compiling GPU-ME shader ${sh}.comp")
+        list(APPEND GPU_ME_SHADER_HDRS ${CMAKE_CURRENT_BINARY_DIR}/${sh}.spv.h)
+    endforeach()
+    add_library(GPU_ME_LIB STATIC svt_gpu_me_vk.cpp ${GPU_ME_SHADER_HDRS})
+    target_include_directories(GPU_ME_LIB PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(GPU_ME_LIB PRIVATE cxx_std_17)
+    target_link_libraries(GPU_ME_LIB PRIVATE Vulkan::Vulkan)
+    target_compile_definitions(CODEC PRIVATE SVT_ENABLE_GPU_ME=1)
+    target_link_libraries(SvtAv1Enc PUBLIC "$<BUILD_INTERFACE:GPU_ME_LIB>" "$<BUILD_INTERFACE:Vulkan::Vulkan>")
+endif()

@@ -1,0 +1,85 @@
+// HME L1 (encoder variant): 32x32 at 1/4 area, +/-4 around 2x L0.
+#version 450
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Planes { uint planes[]; }; // quarter pool
+layout(std430, set = 0, binding = 1) readonly buffer MvIn { uint mvL0[]; };
+layout(std430, set = 0, binding = 2) buffer MvOut { uint mvL1[]; };
+
+layout(push_constant) uniform PC {
+    uint srcOff;
+    uint refOff;
+    uint w, h;
+    uint cols;
+    uint unused;
+} pc;
+
+const int RANGE = 4;
+
+shared uint shKey[128];
+shared uint srcSh[256];
+
+uint sad4(uint a, uint b) {
+    uvec4 av = uvec4(a & 0xFFu, (a >> 8) & 0xFFu, (a >> 16) & 0xFFu, a >> 24);
+    uvec4 bv = uvec4(b & 0xFFu, (b >> 8) & 0xFFu, (b >> 16) & 0xFFu, b >> 24);
+    uvec4 d = max(av, bv) - min(av, bv);
+    return d.x + d.y + d.z + d.w;
+}
+
+int unpackMvX(uint m) { return int(m << 16) >> 16; }
+int unpackMvY(uint m) { return int(m) >> 16; }
+
+void main() {
+    uint blk = gl_WorkGroupID.x;
+    int bx = int(blk % pc.cols) * 32;
+    int by = int(blk / pc.cols) * 32;
+    uint tid = gl_LocalInvocationID.x;
+
+    for (uint i = tid; i < 256u; i += 128u) {
+        uint r = i >> 3, c = i & 7u;
+        srcSh[i] = planes[pc.srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
+    }
+    barrier();
+
+    uint l0 = mvL0[blk];
+    int cx = unpackMvX(l0) * 2, cy = unpackMvY(l0) * 2;
+    int lox = -bx, hix = int(pc.w) - 32 - bx;
+    int loy = -by, hiy = int(pc.h) - 32 - by;
+    int x0 = clamp(cx - RANGE, lox, hix), x1 = clamp(cx + RANGE, lox, hix);
+    int y0 = clamp(cy - RANGE, loy, hiy), y1 = clamp(cy + RANGE, loy, hiy);
+    int nx = x1 - x0 + 1, ny = y1 - y0 + 1;
+    uint numPos = uint(nx * ny);
+
+    uint bestKey = 0xFFFFFFFFu;
+    if (tid < numPos) {
+        int dx = x0 + int(tid) % nx;
+        int dy = y0 + int(tid) / nx;
+        uint sad = 0u;
+        uint o0 = (uint(by + dy)) * pc.w + uint(bx + dx);
+        uint sh = (o0 & 3u) * 8u;
+        for (uint y = 0u; y < 32u; y++) {
+            uint wi = pc.refOff + ((o0 + y * pc.w) >> 2u);
+            uint prev = planes[wi];
+            for (uint wI = 0u; wI < 8u; wI++) {
+                uint nxt = planes[wi + wI + 1u];
+                uint r = sh == 0u ? prev : (prev >> sh) | (nxt << (32u - sh));
+                sad += sad4(srcSh[y * 8u + wI], r);
+                prev = nxt;
+            }
+        }
+        bestKey = (sad << 7) | tid;
+    }
+
+    shKey[tid] = bestKey;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) shKey[tid] = min(shKey[tid], shKey[tid + s]);
+        barrier();
+    }
+    if (tid == 0u) {
+        uint pos = shKey[0] & 0x7Fu;
+        int dx = x0 + int(pos) % nx;
+        int dy = y0 + int(pos) / nx;
+        mvL1[blk] = (uint(dy) & 0xFFFFu) << 16 | (uint(dx) & 0xFFFFu);
+    }
+}

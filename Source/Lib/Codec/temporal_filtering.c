@@ -4104,26 +4104,23 @@ static EbErrorType svt_av1_init_temporal_filtering_inner(PictureParentControlSet
 }
 
 // ---- Local experiment: measure CPU cycles spent in temporal filtering ------
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-static volatile LONG64 g_tf_cycles;
-static volatile LONG   g_tf_report_registered;
+#include "stage_timer_local.h"
+static stage_acc64  g_tf_cycles;
+static stage_flag32 g_tf_report_registered;
 static void tf_cycles_report(void) {
-    ULONG64 proc_cycles = 0;
-    QueryProcessCycleTime(GetCurrentProcess(), &proc_cycles);
+    uint64_t proc_cycles = stage_process_ticks();
     fprintf(stderr,
-            "[TF_TIMER] temporal filtering cycles: %lld  process cycles: %llu  share: %.1f%%\n",
-            (long long)g_tf_cycles, proc_cycles, 100.0 * (double)g_tf_cycles / (double)proc_cycles);
+            "[TF_TIMER] temporal filtering cycles: %lld  process cycles: %llu  share: %.1f%%
+",
+            (long long)g_tf_cycles, (unsigned long long)proc_cycles,
+            100.0 * (double)g_tf_cycles / (double)proc_cycles);
 }
 EbErrorType svt_av1_init_temporal_filtering(PictureParentControlSet** pcs_list, PictureParentControlSet* centre_pcs,
                                             MotionEstimationContext_t* me_context_ptr, int32_t segment_index) {
-    if (!InterlockedCompareExchange(&g_tf_report_registered, 1, 0))
+    if (STAGE_ONCE(&g_tf_report_registered))
         atexit(tf_cycles_report);
-    ULONG64 c0 = 0, c1 = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &c0);
-    EbErrorType r = svt_av1_init_temporal_filtering_inner(pcs_list, centre_pcs, me_context_ptr, segment_index);
-    QueryThreadCycleTime(GetCurrentThread(), &c1);
-    InterlockedExchangeAdd64(&g_tf_cycles, (LONG64)(c1 - c0));
+    uint64_t    c0 = stage_thread_ticks();
+    EbErrorType r  = svt_av1_init_temporal_filtering_inner(pcs_list, centre_pcs, me_context_ptr, segment_index);
+    STAGE_ADD64(&g_tf_cycles, stage_thread_ticks() - c0);
     return r;
 }

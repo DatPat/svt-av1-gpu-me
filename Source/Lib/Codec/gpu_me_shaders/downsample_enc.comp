@@ -1,0 +1,38 @@
+// 2x box decimation, integer math identical to buildPyramidCpu:
+// out = (a + b + c + d + 2) >> 2. One thread per output WORD (4 pixels),
+// since SSBOs are addressed as u32 words.
+#version 450
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InBuf { uint inData[]; };
+layout(std430, set = 0, binding = 1) buffer OutBuf { uint outData[]; };
+
+layout(push_constant) uniform PC {
+    uint srcWordOff; // word offset of the source plane
+    uint dstWordOff; // word offset of the destination plane
+    uint inW;        // source width in pixels (multiple of 4)
+    uint outW;       // destination width in pixels (multiple of 4)
+    uint outH;
+} pc;
+
+uint srcByte(uint x, uint y) {
+    uint idx = y * pc.inW + x;
+    return bitfieldExtract(inData[pc.srcWordOff + (idx >> 2)], int((idx & 3u) * 8u), 8);
+}
+
+void main() {
+    uint wordsPerRow = pc.outW >> 2;
+    uint gid = gl_GlobalInvocationID.x;
+    uint totalWords = wordsPerRow * pc.outH;
+    if (gid >= totalWords) return;
+    uint y = gid / wordsPerRow;
+    uint x0 = (gid % wordsPerRow) * 4u;
+    uint packed = 0u;
+    for (uint i = 0u; i < 4u; i++) {
+        uint x = x0 + i;
+        uint v = (srcByte(2u * x, 2u * y) + srcByte(2u * x + 1u, 2u * y) + srcByte(2u * x, 2u * y + 1u) +
+                  srcByte(2u * x + 1u, 2u * y + 1u) + 2u) >> 2u;
+        packed |= v << (i * 8u);
+    }
+    outData[pc.dstWordOff + gid] = packed;
+}

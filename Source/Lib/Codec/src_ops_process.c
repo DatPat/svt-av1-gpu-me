@@ -524,16 +524,15 @@ static void tpl_subpel_search(SequenceControlSet* scs, PictureParentControlSet* 
 }
 
 // ---- Local experiment: measure CPU cycles spent in TPL dispenser -----------
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-static volatile LONG64 g_tpl_cycles;
-static volatile LONG   g_tpl_report_registered;
+#include "stage_timer_local.h"
+static stage_acc64  g_tpl_cycles;
+static stage_flag32 g_tpl_report_registered;
 static void tpl_cycles_report(void) {
-    ULONG64 proc_cycles = 0;
-    QueryProcessCycleTime(GetCurrentProcess(), &proc_cycles);
-    fprintf(stderr, "[TPL_TIMER] TPL dispenser cycles: %lld  process cycles: %llu  share: %.1f%%\n",
-            (long long)g_tpl_cycles, proc_cycles, 100.0 * (double)g_tpl_cycles / (double)proc_cycles);
+    uint64_t proc_cycles = stage_process_ticks();
+    fprintf(stderr, "[TPL_TIMER] TPL dispenser cycles: %lld  process cycles: %llu  share: %.1f%%
+",
+            (long long)g_tpl_cycles, (unsigned long long)proc_cycles,
+            100.0 * (double)g_tpl_cycles / (double)proc_cycles);
 }
 static void tpl_mc_flow_dispenser_sb_generic_inner(EncodeContext* enc_ctx, SequenceControlSet* scs,
                                                    PictureParentControlSet* pcs, int32_t frame_idx,
@@ -542,13 +541,11 @@ static void tpl_mc_flow_dispenser_sb_generic_inner(EncodeContext* enc_ctx, Seque
 static void tpl_mc_flow_dispenser_sb_generic(EncodeContext* enc_ctx, SequenceControlSet* scs,
                                              PictureParentControlSet* pcs, int32_t frame_idx, uint32_t sb_index,
                                              int32_t qIndex, uint8_t dispenser_search_level) {
-    if (!InterlockedCompareExchange(&g_tpl_report_registered, 1, 0))
+    if (STAGE_ONCE(&g_tpl_report_registered))
         atexit(tpl_cycles_report);
-    ULONG64 c0 = 0, c1 = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &c0);
+    uint64_t c0 = stage_thread_ticks();
     tpl_mc_flow_dispenser_sb_generic_inner(enc_ctx, scs, pcs, frame_idx, sb_index, qIndex, dispenser_search_level);
-    QueryThreadCycleTime(GetCurrentThread(), &c1);
-    InterlockedExchangeAdd64(&g_tpl_cycles, (LONG64)(c1 - c0));
+    STAGE_ADD64(&g_tpl_cycles, stage_thread_ticks() - c0);
 }
 static void tpl_mc_flow_dispenser_sb_generic_inner(EncodeContext* enc_ctx, SequenceControlSet* scs,
                                                    PictureParentControlSet* pcs, int32_t frame_idx,

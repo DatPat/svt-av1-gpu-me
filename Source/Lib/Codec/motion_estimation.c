@@ -3080,26 +3080,23 @@ static EbErrorType svt_aom_motion_estimation_b64_inner(
 }
 
 // ---- Local experiment: measure CPU cycles spent in open-loop ME ------------
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-static volatile LONG64 g_me_cycles;
-static volatile LONG   g_me_report_registered;
+#include "stage_timer_local.h"
+static stage_acc64  g_me_cycles;
+static stage_flag32 g_me_report_registered;
 static void me_cycles_report(void) {
-    ULONG64 proc_cycles = 0;
-    QueryProcessCycleTime(GetCurrentProcess(), &proc_cycles);
+    uint64_t proc_cycles = stage_process_ticks();
     fprintf(stderr,
-            "[ME_TIMER] open-loop ME cycles: %lld  process cycles: %llu  share: %.1f%%\n",
-            (long long)g_me_cycles, proc_cycles, 100.0 * (double)g_me_cycles / (double)proc_cycles);
+            "[ME_TIMER] open-loop ME cycles: %lld  process cycles: %llu  share: %.1f%%
+",
+            (long long)g_me_cycles, (unsigned long long)proc_cycles,
+            100.0 * (double)g_me_cycles / (double)proc_cycles);
 }
 EbErrorType svt_aom_motion_estimation_b64(PictureParentControlSet* pcs, uint32_t b64_index, uint32_t b64_origin_x,
                                           uint32_t b64_origin_y, MeContext* me_ctx, EbPictureBufferDesc* input_ptr) {
-    if (!InterlockedCompareExchange(&g_me_report_registered, 1, 0))
+    if (STAGE_ONCE(&g_me_report_registered))
         atexit(me_cycles_report);
-    ULONG64 c0 = 0, c1 = 0;
-    QueryThreadCycleTime(GetCurrentThread(), &c0);
+    uint64_t    c0 = stage_thread_ticks();
     EbErrorType r = svt_aom_motion_estimation_b64_inner(pcs, b64_index, b64_origin_x, b64_origin_y, me_ctx, input_ptr);
-    QueryThreadCycleTime(GetCurrentThread(), &c1);
-    InterlockedExchangeAdd64(&g_me_cycles, (LONG64)(c1 - c0));
+    STAGE_ADD64(&g_me_cycles, stage_thread_ticks() - c0);
     return r;
 }

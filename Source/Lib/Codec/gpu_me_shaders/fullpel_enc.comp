@@ -1,0 +1,159 @@
+// Full-pel (encoder variant): dual-window search (+/-8 around 2x the HME
+// predictor AND around the zero MV — SVT's CPU path has an equivalent
+// zero check; skipping it loses quality on flat/noisy blocks).
+// 256 threads = 4 position-groups x 64 sub-block threads. Winners tracked
+// as (SAD << 10 | window<<9 | posIdx) 32-bit min-keys. Results written in
+// SVT-AV1's ME layout (GpuMeB64Result: u32 sad[85] then u32 mv[85];
+// 16x16s z-ordered under their 32x32, 8x8s quadrant-ordered under their
+// 16x16; MV packed (y & 0xffff) << 16 | (x & 0xffff), full-pel).
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Planes { uint planes[]; }; // full pool
+layout(std430, set = 0, binding = 1) readonly buffer MvIn { uint mvL1[]; };
+layout(std430, set = 0, binding = 2) buffer Results { uint results[]; };
+
+layout(push_constant) uniform PC {
+    uint srcOff;
+    uint refOff;
+    uint w, h;
+    uint cols;
+    uint resOff; // word offset of this pair's result region
+} pc;
+
+const int RANGE = 8;
+
+shared uint srcSh[1024];
+shared uint sh8[4][64];
+shared uint sh16[4][16];
+shared uint sh32[4][4];
+shared uint mergeBuf[85 * 4];
+
+uint sad4(uint a, uint b) {
+    uvec4 av = uvec4(a & 0xFFu, (a >> 8) & 0xFFu, (a >> 16) & 0xFFu, a >> 24);
+    uvec4 bv = uvec4(b & 0xFFu, (b >> 8) & 0xFFu, (b >> 16) & 0xFFu, b >> 24);
+    uvec4 d = max(av, bv) - min(av, bv);
+    return d.x + d.y + d.z + d.w;
+}
+
+int unpackMvX(uint m) { return int(m << 16) >> 16; }
+int unpackMvY(uint m) { return int(m) >> 16; }
+
+// SVT index of the 16x16 at raster (x16, y16): z-order under the 32x32.
+uint svt16Idx(uint x16, uint y16) {
+    return ((y16 >> 1u) * 2u + (x16 >> 1u)) * 4u + (y16 & 1u) * 2u + (x16 & 1u);
+}
+
+void main() {
+    uint blk = gl_WorkGroupID.x;
+    int bx = int(blk % pc.cols) * 64;
+    int by = int(blk / pc.cols) * 64;
+    uint tid = gl_LocalInvocationID.x;
+    uint grp = tid >> 6u;
+    uint t64 = tid & 63u;
+
+    for (uint i = tid; i < 1024u; i += 256u) {
+        uint r = i >> 4, c = i & 15u;
+        srcSh[i] = planes[pc.srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
+    }
+    barrier();
+
+    uint l1 = mvL1[blk];
+    int pcx = unpackMvX(l1) * 2, pcy = unpackMvY(l1) * 2;
+    int lox = -bx, hix = int(pc.w) - 64 - bx;
+    int loy = -by, hiy = int(pc.h) - 64 - by;
+    int winCx[2] = int[2](pcx, 0);
+    int winCy[2] = int[2](pcy, 0);
+    uint numWin = (pcx != 0 || pcy != 0) ? 2u : 1u;
+
+    uint sub8x = (t64 & 7u) * 8u;
+    uint sub8y = (t64 >> 3u) * 8u;
+
+    uint key8 = 0xFFFFFFFFu, key16 = 0xFFFFFFFFu, key32 = 0xFFFFFFFFu, key64 = 0xFFFFFFFFu;
+
+    for (uint wIdx = 0u; wIdx < numWin; wIdx++) {
+        int x0 = clamp(winCx[wIdx] - RANGE, lox, hix), x1 = clamp(winCx[wIdx] + RANGE, lox, hix);
+        int y0 = clamp(winCy[wIdx] - RANGE, loy, hiy), y1 = clamp(winCy[wIdx] + RANGE, loy, hiy);
+        int nx = x1 - x0 + 1;
+        uint numPos = uint(nx * (y1 - y0 + 1));
+
+        uint iters = (numPos + 3u) / 4u;
+        for (uint it = 0u; it < iters; it++) {
+            uint pos = it * 4u + grp;
+            bool inRange = pos < numPos;
+            uint posC = inRange ? pos : 0u;
+            int dx = x0 + int(posC) % nx;
+            int dy = y0 + int(posC) / nx;
+            uint posKey = (wIdx << 9) | pos;
+
+            uint sad = 0u;
+            uint o0 = (uint(by + dy) + sub8y) * pc.w + uint(bx + dx) + sub8x;
+            uint sh = (o0 & 3u) * 8u;
+            for (uint y = 0u; y < 8u; y++) {
+                uint o = o0 + y * pc.w;
+                uint wi = pc.refOff + (o >> 2u);
+                uint w0 = planes[wi], w1 = planes[wi + 1u], w2 = planes[wi + 2u];
+                uint r0 = sh == 0u ? w0 : (w0 >> sh) | (w1 << (32u - sh));
+                uint r1 = sh == 0u ? w1 : (w1 >> sh) | (w2 << (32u - sh));
+                uint sIdx = (sub8y + y) * 16u + (sub8x >> 2u);
+                sad += sad4(srcSh[sIdx], r0) + sad4(srcSh[sIdx + 1u], r1);
+            }
+            if (inRange) key8 = min(key8, (sad << 10) | posKey);
+            sh8[grp][t64] = sad;
+            barrier();
+            if (t64 < 16u) {
+                uint gx = (t64 & 3u) * 2u, gy = (t64 >> 2u) * 2u;
+                uint s16 = sh8[grp][gy * 8u + gx] + sh8[grp][gy * 8u + gx + 1u] + sh8[grp][(gy + 1u) * 8u + gx] +
+                    sh8[grp][(gy + 1u) * 8u + gx + 1u];
+                if (inRange) key16 = min(key16, (s16 << 10) | posKey);
+                sh16[grp][t64] = s16;
+            }
+            barrier();
+            if (t64 < 4u) {
+                uint gx = (t64 & 1u) * 2u, gy = (t64 >> 1u) * 2u;
+                uint s32 = sh16[grp][gy * 4u + gx] + sh16[grp][gy * 4u + gx + 1u] + sh16[grp][(gy + 1u) * 4u + gx] +
+                    sh16[grp][(gy + 1u) * 4u + gx + 1u];
+                if (inRange) key32 = min(key32, (s32 << 10) | posKey);
+                sh32[grp][t64] = s32;
+            }
+            barrier();
+            if (t64 == 0u && inRange) {
+                uint s64 = sh32[grp][0] + sh32[grp][1] + sh32[grp][2] + sh32[grp][3];
+                key64 = min(key64, (s64 << 10) | posKey);
+            }
+            barrier();
+        }
+    }
+
+    mergeBuf[(21u + t64) * 4u + grp] = key8;
+    if (t64 < 16u) mergeBuf[(5u + t64) * 4u + grp] = key16;
+    if (t64 < 4u) mergeBuf[(1u + t64) * 4u + grp] = key32;
+    if (t64 == 0u) mergeBuf[grp] = key64;
+    barrier();
+
+    if (tid < 85u) {
+        uint k = min(min(mergeBuf[tid * 4u], mergeBuf[tid * 4u + 1u]),
+                     min(mergeBuf[tid * 4u + 2u], mergeBuf[tid * 4u + 3u]));
+        // decode (window, pos) -> MV
+        uint wIdx = (k >> 9) & 1u;
+        uint p = k & 0x1FFu;
+        int x0 = clamp(winCx[wIdx] - RANGE, lox, hix), x1 = clamp(winCx[wIdx] + RANGE, lox, hix);
+        int y0 = clamp(winCy[wIdx] - RANGE, loy, hiy);
+        int nx = x1 - x0 + 1;
+        uint mv = (uint(y0 + int(p) / nx) & 0xFFFFu) << 16 | (uint(x0 + int(p) % nx) & 0xFFFFu);
+        // internal (raster) index -> SVT layout index
+        uint svt;
+        if (tid == 0u) svt = 0u;
+        else if (tid < 5u) svt = tid; // 32x32: raster == SVT
+        else if (tid < 21u) {
+            uint r = tid - 5u;
+            svt = 5u + svt16Idx(r & 3u, r >> 2u);
+        } else {
+            uint r = tid - 21u, x8 = r & 7u, y8 = r >> 3u;
+            svt = 21u + svt16Idx(x8 >> 1u, y8 >> 1u) * 4u + (y8 & 1u) * 2u + (x8 & 1u);
+        }
+        uint outBase = pc.resOff + blk * 170u;
+        results[outBase + svt] = k >> 10;    // sad[85] first
+        results[outBase + 85u + svt] = mv;   // then mv[85]
+    }
+}
