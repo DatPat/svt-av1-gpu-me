@@ -15,7 +15,7 @@ layout(push_constant) uniform PC {
     uint u0, u1;
 } pc;
 
-const int RANGE = 24;
+const int RANGE = 16;
 
 shared uint shKey[128];
 shared uint srcSh[64];
@@ -64,7 +64,7 @@ void main() {
                 prev = nxt;
             }
         }
-        bestKey = min(bestKey, (sad << 12) | pos);
+        bestKey = min(bestKey, (sad << 11) | pos);
     }
 
     shKey[tid] = bestKey;
@@ -74,7 +74,7 @@ void main() {
         barrier();
     }
     if (tid == 0u) {
-        uint pos = shKey[0] & 0xFFFu;
+        uint pos = shKey[0] & 0x7FFu;
         int dx = x0 + int(pos) % nx;
         int dy = y0 + int(pos) / nx;
         mvOut[pairIdx * pc.blocks + blk] = (uint(dy) & 0xFFFFu) << 16 | (uint(dx) & 0xFFFFu);

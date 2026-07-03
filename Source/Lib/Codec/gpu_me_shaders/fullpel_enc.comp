@@ -21,7 +21,7 @@ layout(push_constant) uniform PC {
     uint u0, u1;
 } pc;
 
-const int RANGE = 12;
+const int RANGE = 8;
 
 shared uint srcSh[1024];
 shared uint sh8[4][64];
@@ -88,7 +88,7 @@ void main() {
             uint posC = inRange ? pos : 0u;
             int dx = x0 + int(posC) % nx;
             int dy = y0 + int(posC) / nx;
-            uint posKey = (wIdx << 10) | pos;
+            uint posKey = (wIdx << 9) | pos;
 
             uint sad = 0u;
             uint o0 = (uint(by + dy) + sub8y) * pc.w + uint(bx + dx) + sub8x;
@@ -106,14 +106,14 @@ void main() {
             // exhaustive search does not noise-fit on flat content (a few
             // SAD points must not buy a random MV that costs bits to code).
             sad += 4u * uint(abs(dx) + abs(dy));
-            if (inRange) key8 = min(key8, (sad << 11) | posKey);
+            if (inRange) key8 = min(key8, (sad << 10) | posKey);
             sh8[grp][t64] = sad;
             barrier();
             if (t64 < 16u) {
                 uint gx = (t64 & 3u) * 2u, gy = (t64 >> 2u) * 2u;
                 uint s16 = sh8[grp][gy * 8u + gx] + sh8[grp][gy * 8u + gx + 1u] + sh8[grp][(gy + 1u) * 8u + gx] +
                     sh8[grp][(gy + 1u) * 8u + gx + 1u];
-                if (inRange) key16 = min(key16, (s16 << 11) | posKey);
+                if (inRange) key16 = min(key16, (s16 << 10) | posKey);
                 sh16[grp][t64] = s16;
             }
             barrier();
@@ -121,13 +121,13 @@ void main() {
                 uint gx = (t64 & 1u) * 2u, gy = (t64 >> 1u) * 2u;
                 uint s32 = sh16[grp][gy * 4u + gx] + sh16[grp][gy * 4u + gx + 1u] + sh16[grp][(gy + 1u) * 4u + gx] +
                     sh16[grp][(gy + 1u) * 4u + gx + 1u];
-                if (inRange) key32 = min(key32, (s32 << 11) | posKey);
+                if (inRange) key32 = min(key32, (s32 << 10) | posKey);
                 sh32[grp][t64] = s32;
             }
             barrier();
             if (t64 == 0u && inRange) {
                 uint s64 = sh32[grp][0] + sh32[grp][1] + sh32[grp][2] + sh32[grp][3];
-                key64 = min(key64, (s64 << 11) | posKey);
+                key64 = min(key64, (s64 << 10) | posKey);
             }
             barrier();
         }
@@ -143,8 +143,8 @@ void main() {
         uint k = min(min(mergeBuf[tid * 4u], mergeBuf[tid * 4u + 1u]),
                      min(mergeBuf[tid * 4u + 2u], mergeBuf[tid * 4u + 3u]));
         // decode (window, pos) -> MV
-        uint wIdx = (k >> 10) & 1u;
-        uint p = k & 0x3FFu;
+        uint wIdx = (k >> 9) & 1u;
+        uint p = k & 0x1FFu;
         int x0 = clamp(winCx[wIdx] - RANGE, lox, hix), x1 = clamp(winCx[wIdx] + RANGE, lox, hix);
         int y0 = clamp(winCy[wIdx] - RANGE, loy, hiy);
         int nx = x1 - x0 + 1;
@@ -165,7 +165,7 @@ void main() {
         uint nSub8 = tid == 0u ? 64u : tid < 5u ? 16u : tid < 21u ? 4u : 1u;
         int mdx = int(mv << 16) >> 16, mdy = int(mv) >> 16;
         uint pen = 4u * nSub8 * uint(abs(mdx) + abs(mdy));
-        results[outBase + svt] = (k >> 11) - pen; // sad[85] first
+        results[outBase + svt] = (k >> 10) - pen; // sad[85] first
         results[outBase + 85u + svt] = mv;        // then mv[85]
     }
 }
