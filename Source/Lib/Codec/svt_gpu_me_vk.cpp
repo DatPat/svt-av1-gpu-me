@@ -116,7 +116,9 @@ struct Ctx {
     std::atomic<uint64_t> acquireFails{0};
 };
 
-Ctx g_ctx;
+// Leaky singleton: detached workers may still reference these at process
+// exit; destroying their mutexes/CVs underneath them hangs glibc teardown.
+Ctx& g_ctx = *new Ctx;
 thread_local int t_laneIdx = NUM_LANES - 1;
 
 #define VKC(call)                                                                     \
@@ -683,7 +685,7 @@ struct PrefetchPool {
     }
 };
 
-PrefetchPool g_prefetch;
+PrefetchPool& g_prefetch = *new PrefetchPool; // leaky singleton, see g_ctx
 
 } // namespace
 
