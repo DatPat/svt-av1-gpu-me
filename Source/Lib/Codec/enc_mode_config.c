@@ -4194,35 +4194,34 @@ static bool dimensions_require_8x8(const uint16_t aligned_width, const uint16_t 
     return true;
 }
 
-#ifdef SVT_ENABLE_GPU_ME
-#include "svt_gpu_me.h"
-// Experiment: with GPU ME's higher-quality distortions feeding the per-SB
-// depth decisions below, allow boosting the depth-removal aggressiveness
-// via env SVT_GPU_MD_PRUNE=<n> (only active when SVT_GPU_ME=1).
+// Per-SB gated depth-removal boost via env SVT_GPU_MD_PRUNE=<n>.
+// The gate compares the SB's 64x64 ME distortion against the sum of its
+// best per-8x8 distortions (a single MV explaining the whole SB means
+// deeper partitions cannot buy meaningful distortion). Works with either
+// the GPU-injected ME distortions or the stock CPU ME's own arrays, so it
+// needs no GPU to be active.
+#include <stdlib.h>
 static int gpu_md_prune_boost(void) {
     static int boost = -1;
     if (boost < 0) {
         const char* e = getenv("SVT_GPU_MD_PRUNE");
-        boost         = (e && svt_gpu_me_enabled()) ? atoi(e) : 0;
+        boost         = e ? atoi(e) : 0;
         if (boost < 0) boost = 0;
     }
     return boost;
 }
-#endif
 static void set_depth_removal_level_controls(PictureControlSet* pcs, ModeDecisionContext* ctx,
                                              uint8_t depth_removal_level) {
     DepthRemovalCtrls* depth_removal_ctrls = &ctx->depth_removal_ctrls;
-#ifdef SVT_ENABLE_GPU_ME
-    // Per-SB gate: only boost pruning where the GPU SAD hierarchy shows a
-    // single 64x64 MV already matches the sum of the best per-8x8 MVs
-    // (within 5%) - i.e. where splitting cannot buy meaningful distortion.
+    // Per-SB gate: only boost pruning where a single 64x64 MV already
+    // matches the sum of the best per-8x8 MVs (within 5%) - i.e. where
+    // splitting cannot buy meaningful distortion.
     if (gpu_md_prune_boost() && pcs->slice_type != I_SLICE) {
         const uint64_t d64 = pcs->ppcs->me_64x64_distortion[ctx->sb_index];
         const uint64_t d8  = pcs->ppcs->me_8x8_distortion[ctx->sb_index];
         if (d64 * 100 <= d8 * 105)
             depth_removal_level = (uint8_t)MIN(depth_removal_level + gpu_md_prune_boost(), 15);
     }
-#endif
     if (pcs->slice_type == I_SLICE) {
         depth_removal_ctrls->enabled = 0;
     } else {
