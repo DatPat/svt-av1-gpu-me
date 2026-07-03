@@ -257,6 +257,14 @@ __global__ void mePairKernel(MeLaunchArgs args, int w, int h, int cols, int bloc
                 sadB += sad8px(srcB[y * 2], srcB[y * 2 + 1], rowB, shift);
             }
         }
+        // MV-cost regularization: bias toward short/zero vectors so the
+        // exhaustive search does not noise-fit on flat content.
+        {
+            int pdx = x0 + px, pdy = y0 + py;
+            uint32_t pen = 4u * (uint32_t)(abs(pdx) + abs(pdy));
+            sadA += pen;
+            sadB += pen;
+        }
         unsigned long long posKey = (unsigned)((wi << 20) | pos);
         key8A = min(key8A, ((unsigned long long)sadA << 32) | posKey);
         key8B = min(key8B, ((unsigned long long)sadB << 32) | posKey);
@@ -318,7 +326,11 @@ __global__ void mePairKernel(MeLaunchArgs args, int w, int h, int cols, int bloc
             svt = 21 + svt16Idx(x8 >> 1, y8 >> 1) * 4 + (y8 & 1) * 2 + (x8 & 1);
         }
         GpuMeB64Result& out = results[(size_t)ri * blocks + blk];
-        out.sad[svt] = (uint32_t)(best >> 32);
+        // The MV-cost penalty steered selection only; report the raw SAD
+        // (recoverable: penalty is a function of the winning MV and level).
+        uint32_t nSub8 = tid == 0 ? 64u : tid < 5 ? 16u : tid < 21 ? 4u : 1u;
+        uint32_t pen = 4u * nSub8 * (uint32_t)(abs(dx) + abs(dy));
+        out.sad[svt] = (uint32_t)(best >> 32) - pen;
         out.mv[svt] = ((uint32_t)(uint16_t)(int16_t)dy << 16) | (uint16_t)(int16_t)dx;
     }
 }
