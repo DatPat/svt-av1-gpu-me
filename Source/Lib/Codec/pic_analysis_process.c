@@ -1,0 +1,2149 @@
+/*
+* Copyright(c) 2019 Intel Corporation
+*
+* This source code is subject to the terms of the BSD 3-Clause Clear License and
+* the Alliance for Open Media Patent License 1.0. If the BSD 3-Clause Clear License
+* was not distributed with this source code in the LICENSE file, you can
+* obtain it at https://www.aomedia.org/license. If the Alliance for Open
+* Media Patent License 1.0 was not distributed with this source code in the
+* PATENTS file, you can obtain it at https://www.aomedia.org/license/patent-license.
+*/
+
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "aom_dsp_rtcd.h"
+#include "definitions.h"
+#if OPT_TUNE_VMAF
+#include <math.h>
+#include "temporal_filtering.h"
+#endif
+#include "enc_handle.h"
+#include "sys_resource_manager.h"
+#include "pcs.h"
+#include "sequence_control_set.h"
+#include "pic_buffer_desc.h"
+
+#include "resource_coordination_results.h"
+#include "pic_analysis_process.h"
+#include "pic_analysis_results.h"
+#include "reference_object.h"
+#include "utility.h"
+#include "me_context.h"
+#include "pic_operators.h"
+#include "resize.h"
+#include "av1me.h"
+
+#define VARIANCE_PRECISION 16
+
+/**************************************
+ * Context
+ **************************************/
+typedef struct PictureAnalysisContext {
+    EbFifo* resource_coordination_results_input_fifo_ptr;
+    EbFifo* picture_analysis_results_output_fifo_ptr;
+#if FTR_TUNE_VMAF
+    int16_t* vmaf_hring[5];
+    int      vmaf_padded_w;
+    uint8_t* vmaf_blur_plane;
+    int      vmaf_blur_pixels;
+#endif
+} PictureAnalysisContext;
+
+static void picture_analysis_context_dctor(EbPtr p) {
+    EbThreadContext*        thread_ctx = (EbThreadContext*)p;
+    PictureAnalysisContext* obj        = (PictureAnalysisContext*)thread_ctx->priv;
+#if FTR_TUNE_VMAF
+    for (int i = 0; i < 5; i++) {
+        EB_FREE_ARRAY(obj->vmaf_hring[i]);
+    }
+    EB_FREE_ARRAY(obj->vmaf_blur_plane);
+#endif
+    EB_FREE_ARRAY(obj);
+}
+
+/************************************************
+ * Picture Analysis Context Constructor
+ ************************************************/
+EbErrorType svt_aom_picture_analysis_context_ctor(EbThreadContext* thread_ctx, const EbEncHandle* enc_handle_ptr,
+                                                  int index) {
+    PictureAnalysisContext* pa_ctx;
+    EB_CALLOC_ARRAY(pa_ctx, 1);
+    thread_ctx->priv  = pa_ctx;
+    thread_ctx->dctor = picture_analysis_context_dctor;
+
+    pa_ctx->resource_coordination_results_input_fifo_ptr = svt_system_resource_get_consumer_fifo(
+        enc_handle_ptr->resource_coordination_results_resource_ptr, index);
+    pa_ctx->picture_analysis_results_output_fifo_ptr = svt_system_resource_get_producer_fifo(
+        enc_handle_ptr->picture_analysis_results_resource_ptr, index);
+    return EB_ErrorNone;
+}
+
+void svt_aom_down_sample_chroma(EbPictureBufferDesc* input_pic, EbPictureBufferDesc* outputPicturePtr) {
+    uint32_t       input_color_format  = input_pic->color_format;
+    const uint16_t input_subsampling_x = (input_color_format == EB_YUV444 ? 0 : 1);
+    const uint16_t input_subsampling_y = (input_color_format >= EB_YUV422 ? 0 : 1);
+
+    uint32_t       output_color_format  = outputPicturePtr->color_format;
+    const uint16_t output_subsampling_x = (output_color_format == EB_YUV444 ? 0 : 1);
+    const uint16_t output_subsampling_y = (output_color_format >= EB_YUV422 ? 0 : 1);
+
+    uint32_t stride_in, stride_out;
+
+    uint8_t* ptr_in;
+    uint8_t* ptr_out;
+
+    uint32_t ii, jj;
+
+    //Cb
+    {
+        stride_in = input_pic->u_stride;
+        ptr_in    = input_pic->u_buffer;
+
+        stride_out = outputPicturePtr->u_stride;
+        ptr_out    = outputPicturePtr->u_buffer;
+
+        for (jj = 0; jj < (uint32_t)(outputPicturePtr->height >> output_subsampling_y); jj++) {
+            for (ii = 0; ii < (uint32_t)(outputPicturePtr->width >> output_subsampling_x); ii++) {
+                ptr_out[ii + jj * stride_out] =
+                    ptr_in[(ii << (1 - input_subsampling_x)) + (jj << (1 - input_subsampling_y)) * stride_in];
+            }
+        }
+    }
+
+    //Cr
+    {
+        stride_in = input_pic->v_stride;
+        ptr_in    = input_pic->v_buffer;
+
+        stride_out = outputPicturePtr->v_stride;
+        ptr_out    = outputPicturePtr->v_buffer;
+
+        for (jj = 0; jj < (uint32_t)(outputPicturePtr->height >> output_subsampling_y); jj++) {
+            for (ii = 0; ii < (uint32_t)(outputPicturePtr->width >> output_subsampling_x); ii++) {
+                ptr_out[ii + jj * stride_out] =
+                    ptr_in[(ii << (1 - input_subsampling_x)) + (jj << (1 - input_subsampling_y)) * stride_in];
+            }
+        }
+    }
+}
+
+/************************************************
+ * Picture Analysis Context Destructor
+ ************************************************/
+/********************************************
+ * downsample_2d
+ *      downsamples the input
+ * Performs filtering (2x2, 0-phase)
+ ********************************************/
+void svt_aom_downsample_2d_c(uint8_t* input_samples, // input parameter, input samples Ptr
+                             uint32_t input_stride, // input parameter, input stride
+                             uint32_t input_area_width, // input parameter, input area width
+                             uint32_t input_area_height, // input parameter, input area height
+                             uint8_t* decim_samples, // output parameter, decimated samples Ptr
+                             uint32_t decim_stride, // input parameter, output stride
+                             uint32_t decim_step) // input parameter, decimation amount in pixels
+{
+    uint32_t       horizontal_index;
+    uint32_t       vertical_index;
+    uint32_t       input_stripe_stride = input_stride * decim_step;
+    uint32_t       decim_horizontal_index;
+    const uint32_t half_decim_step = decim_step >> 1;
+
+    for (input_samples += half_decim_step * input_stride, vertical_index = half_decim_step;
+         vertical_index < input_area_height;
+         vertical_index += decim_step) {
+        uint8_t* prev_input_line = input_samples - input_stride;
+        for (horizontal_index = half_decim_step, decim_horizontal_index = 0; horizontal_index < input_area_width;
+             horizontal_index += decim_step, decim_horizontal_index++) {
+            uint32_t sum = (uint32_t)prev_input_line[horizontal_index - 1] +
+                (uint32_t)prev_input_line[horizontal_index] + (uint32_t)input_samples[horizontal_index - 1] +
+                (uint32_t)input_samples[horizontal_index];
+            decim_samples[decim_horizontal_index] = (sum + 2) >> 2;
+        }
+        input_samples += input_stripe_stride;
+        decim_samples += decim_stride;
+    }
+
+    return;
+}
+
+/********************************************
+* calculate_histogram
+*      creates n-bins histogram for the input
+********************************************/
+void calculate_histogram(uint8_t*  input_samples, // input parameter, input samples Ptr
+                         uint32_t  input_area_width, // input parameter, input area width
+                         uint32_t  input_area_height, // input parameter, input area height
+                         uint32_t  stride, // input parameter, input stride
+                         uint8_t   decim_step, // input parameter, area height
+                         uint32_t* histogram, // output parameter, output histogram
+                         uint64_t* sum) {
+    uint32_t horizontal_index;
+    uint32_t vertical_index;
+    for (vertical_index = 0; vertical_index < input_area_height; vertical_index += decim_step) {
+        for (horizontal_index = 0; horizontal_index < input_area_width; horizontal_index += decim_step) {
+            ++(histogram[input_samples[horizontal_index]]);
+            *sum += input_samples[horizontal_index];
+        }
+        input_samples += (stride * decim_step);
+    }
+
+    return;
+}
+
+/*******************************************
+ * compute_mean
+ *   returns the mean of a block
+ *******************************************/
+uint64_t svt_compute_mean_c(uint8_t* input_samples, /**< input parameter, input samples Ptr */
+                            uint32_t input_stride, /**< input parameter, input stride */
+                            uint32_t input_area_width, /**< input parameter, input area width */
+                            uint32_t input_area_height) /**< input parameter, input area height */
+{
+    uint32_t hi, vi;
+    uint64_t block_mean = 0;
+    assert(input_area_width > 0);
+    assert(input_area_height > 0);
+
+    for (vi = 0; vi < input_area_height; vi++) {
+        for (hi = 0; hi < input_area_width; hi++) {
+            block_mean += input_samples[hi];
+        }
+        input_samples += input_stride;
+    }
+
+    block_mean = (block_mean << (VARIANCE_PRECISION >> 1)) / (input_area_width * input_area_height);
+
+    return block_mean;
+}
+
+/*******************************************
+ * svt_compute_mean_squared_values_c
+ *   returns the Mean of Squared Values
+ *******************************************/
+uint64_t svt_compute_mean_squared_values_c(uint8_t* input_samples, /**< input parameter, input samples Ptr */
+                                           uint32_t input_stride, /**< input parameter, input stride */
+                                           uint32_t input_area_width, /**< input parameter, input area width */
+                                           uint32_t input_area_height) /**< input parameter, input area height */
+{
+    uint32_t hi, vi;
+    uint64_t block_mean = 0;
+    assert(input_area_width > 0);
+    assert(input_area_height > 0);
+
+    for (vi = 0; vi < input_area_height; vi++) {
+        for (hi = 0; hi < input_area_width; hi++) {
+            block_mean += input_samples[hi] * input_samples[hi];
+        }
+        input_samples += input_stride;
+    }
+
+    block_mean = (block_mean << VARIANCE_PRECISION) / (input_area_width * input_area_height);
+
+    return block_mean;
+}
+
+uint64_t svt_compute_sub_mean_8x8_c(uint8_t* input_samples, /**< input parameter, input samples Ptr */
+                                    uint16_t input_stride) /**< input parameter, input stride */
+{
+    uint32_t hi, vi;
+    uint64_t block_mean = 0;
+    uint16_t skip       = 0;
+
+    for (vi = 0; skip < 8; skip = vi + vi) {
+        for (hi = 0; hi < 8; hi++) {
+            block_mean += input_samples[hi];
+        }
+        input_samples += 2 * input_stride;
+        vi++;
+    }
+
+    block_mean = block_mean << 3; // (VARIANCE_PRECISION >> 1)) /
+    // (input_area_width * input_area_height/2)
+
+    return block_mean;
+}
+
+uint64_t svt_aom_compute_sub_mean_squared_values_c(
+    uint8_t* input_samples, /**< input parameter, input samples Ptr */
+    uint32_t input_stride, /**< input parameter, input stride */
+    uint32_t input_area_width, /**< input parameter, input area width */
+    uint32_t input_area_height) /**< input parameter, input area height */
+{
+    uint32_t hi, vi;
+    uint64_t block_mean = 0;
+    uint16_t skip       = 0;
+
+    for (vi = 0; skip < input_area_height; skip = vi + vi) {
+        for (hi = 0; hi < input_area_width; hi++) {
+            block_mean += input_samples[hi] * input_samples[hi];
+        }
+        input_samples += 2 * input_stride;
+        vi++;
+    }
+
+    block_mean = block_mean << 11; // VARIANCE_PRECISION) / (input_area_width * input_area_height);
+
+    return block_mean;
+}
+
+void svt_compute_interm_var_four8x8_c(uint8_t* input_samples, uint16_t input_stride,
+                                      uint64_t* mean_of8x8_blocks, // mean of four  8x8
+                                      uint64_t* mean_of_squared8x8_blocks) // meanSquared
+{
+    uint32_t block_index = 0;
+    // (0,1)
+    mean_of8x8_blocks[0]         = svt_compute_sub_mean_8x8_c(input_samples + block_index, input_stride);
+    mean_of_squared8x8_blocks[0] = svt_aom_compute_sub_mean_squared_values_c(
+        input_samples + block_index, input_stride, 8, 8);
+
+    // (0,2)
+    block_index                  = block_index + 8;
+    mean_of8x8_blocks[1]         = svt_compute_sub_mean_8x8_c(input_samples + block_index, input_stride);
+    mean_of_squared8x8_blocks[1] = svt_aom_compute_sub_mean_squared_values_c(
+        input_samples + block_index, input_stride, 8, 8);
+
+    // (0,3)
+    block_index                  = block_index + 8;
+    mean_of8x8_blocks[2]         = svt_compute_sub_mean_8x8_c(input_samples + block_index, input_stride);
+    mean_of_squared8x8_blocks[2] = svt_aom_compute_sub_mean_squared_values_c(
+        input_samples + block_index, input_stride, 8, 8);
+
+    // (0,4)
+    block_index                  = block_index + 8;
+    mean_of8x8_blocks[3]         = svt_compute_sub_mean_8x8_c(input_samples + block_index, input_stride);
+    mean_of_squared8x8_blocks[3] = svt_aom_compute_sub_mean_squared_values_c(
+        input_samples + block_index, input_stride, 8, 8);
+}
+
+/*******************************************
+* computes and stores the variance of the passed 64x64 block (and subblocks, if required)
+*******************************************/
+static void compute_b64_variance(SequenceControlSet* scs, PictureParentControlSet* pcs,
+                                 EbPictureBufferDesc* input_padded_pic, const uint32_t b64_idx,
+                                 const uint32_t input_luma_origin_index) {
+    uint64_t mean_of8x8_blocks[64];
+    uint64_t mean_of_8x8_squared_values_blocks[64];
+
+    uint64_t mean_of_16x16_blocks[16];
+    uint64_t mean_of16x16_squared_values_blocks[16];
+
+    uint64_t mean_of_32x32_blocks[4];
+    uint64_t mean_of32x32_squared_values_blocks[4];
+
+    uint64_t mean_of_64x64_blocks;
+    uint64_t mean_of64x64_squared_values_blocks;
+
+    const EbByte   y_buffer = input_padded_pic->y_buffer;
+    const uint16_t y_stride = input_padded_pic->y_stride;
+    if (scs->block_mean_calc_prec == BLOCK_MEAN_PREC_FULL) {
+        // Iterate over all 8x8 blocks and compute mean and mean squared
+        for (int blk_8x8_row = 0; blk_8x8_row < 8; blk_8x8_row++) {
+            int blk_offset = input_luma_origin_index + 8 * y_stride * blk_8x8_row;
+            for (int blk_8x8_col = 0; blk_8x8_col < 8; blk_8x8_col++) {
+                const int blk_8x8_idx          = 8 * blk_8x8_row + blk_8x8_col;
+                mean_of8x8_blocks[blk_8x8_idx] = svt_compute_mean_8x8(y_buffer + blk_offset, y_stride, 8, 8);
+                mean_of_8x8_squared_values_blocks[blk_8x8_idx] = svt_compute_mean_square_values_8x8(
+                    y_buffer + blk_offset, y_stride, 8, 8);
+                blk_offset += 8;
+            }
+        }
+    } else {
+        // Iterate over all 8x8 blocks and compute mean and mean squared
+        // Each interation loops over four 8x8 blocks (horizontally)
+        for (int blk_8x8_row = 0; blk_8x8_row < 8; blk_8x8_row++) {
+            int blk_offset = input_luma_origin_index + 8 * y_stride * blk_8x8_row;
+            for (int blk_8x8_col = 0; blk_8x8_col < 2; blk_8x8_col++) {
+                const int blk_8x8_idx = 8 * blk_8x8_row + 4 * blk_8x8_col;
+                svt_compute_interm_var_four8x8(y_buffer + blk_offset,
+                                               y_stride,
+                                               &mean_of8x8_blocks[blk_8x8_idx],
+                                               &mean_of_8x8_squared_values_blocks[blk_8x8_idx]);
+                blk_offset += 32; // 4 * 8x8 blocks
+            }
+        }
+    }
+
+    // 16x16
+    for (int blk_16x16_row = 0; blk_16x16_row < 4; blk_16x16_row++) {
+        for (int blk_16x16_col = 0; blk_16x16_col < 4; blk_16x16_col++) {
+            const int blk_16x16_idx             = 4 * blk_16x16_row + blk_16x16_col;
+            const int first_8x8_blk_idx         = 16 * blk_16x16_row + 2 * blk_16x16_col;
+            mean_of_16x16_blocks[blk_16x16_idx] = (mean_of8x8_blocks[first_8x8_blk_idx] +
+                                                   mean_of8x8_blocks[first_8x8_blk_idx + 1] +
+                                                   mean_of8x8_blocks[first_8x8_blk_idx + 8] +
+                                                   mean_of8x8_blocks[first_8x8_blk_idx + 9]) >>
+                2;
+            mean_of16x16_squared_values_blocks[blk_16x16_idx] =
+                (mean_of_8x8_squared_values_blocks[first_8x8_blk_idx] +
+                 mean_of_8x8_squared_values_blocks[first_8x8_blk_idx + 1] +
+                 mean_of_8x8_squared_values_blocks[first_8x8_blk_idx + 8] +
+                 mean_of_8x8_squared_values_blocks[first_8x8_blk_idx + 9]) >>
+                2;
+        }
+    }
+
+    // 32x32
+    for (int blk_32x32_row = 0; blk_32x32_row < 2; blk_32x32_row++) {
+        for (int blk_32x32_col = 0; blk_32x32_col < 2; blk_32x32_col++) {
+            const int blk_32x32_idx             = 2 * blk_32x32_row + blk_32x32_col;
+            const int first_16x16_blk_idx       = 8 * blk_32x32_row + 2 * blk_32x32_col;
+            mean_of_32x32_blocks[blk_32x32_idx] = (mean_of_16x16_blocks[first_16x16_blk_idx] +
+                                                   mean_of_16x16_blocks[first_16x16_blk_idx + 1] +
+                                                   mean_of_16x16_blocks[first_16x16_blk_idx + 4] +
+                                                   mean_of_16x16_blocks[first_16x16_blk_idx + 5]) >>
+                2;
+            mean_of32x32_squared_values_blocks[blk_32x32_idx] =
+                (mean_of16x16_squared_values_blocks[first_16x16_blk_idx] +
+                 mean_of16x16_squared_values_blocks[first_16x16_blk_idx + 1] +
+                 mean_of16x16_squared_values_blocks[first_16x16_blk_idx + 4] +
+                 mean_of16x16_squared_values_blocks[first_16x16_blk_idx + 5]) >>
+                2;
+        }
+    }
+
+    // 64x64
+    mean_of_64x64_blocks = (mean_of_32x32_blocks[0] + mean_of_32x32_blocks[1] + mean_of_32x32_blocks[2] +
+                            mean_of_32x32_blocks[3]) >>
+        2;
+    mean_of64x64_squared_values_blocks = (mean_of32x32_squared_values_blocks[0] +
+                                          mean_of32x32_squared_values_blocks[1] +
+                                          mean_of32x32_squared_values_blocks[2] +
+                                          mean_of32x32_squared_values_blocks[3]) >>
+        2;
+
+    uint16_t* sb_var = pcs->variance[b64_idx];
+    if (scs->allintra || scs->static_config.aq_mode == 1 || scs->static_config.variance_octile) {
+        // 8x8 variances
+        for (int blk_8x8_idx = 0, me_pu_idx = ME_TIER_ZERO_PU_8x8_0; blk_8x8_idx < 64; blk_8x8_idx++, me_pu_idx++) {
+            sb_var[me_pu_idx] = (uint16_t)((mean_of_8x8_squared_values_blocks[blk_8x8_idx] -
+                                            (mean_of8x8_blocks[blk_8x8_idx] * mean_of8x8_blocks[blk_8x8_idx])) >>
+                                           VARIANCE_PRECISION);
+        }
+
+        // 16x16 variances
+        for (int blk_16x16_idx = 0, me_pu_idx = ME_TIER_ZERO_PU_16x16_0; blk_16x16_idx < 16;
+             blk_16x16_idx++, me_pu_idx++) {
+            sb_var[me_pu_idx] = (uint16_t)((mean_of16x16_squared_values_blocks[blk_16x16_idx] -
+                                            (mean_of_16x16_blocks[blk_16x16_idx] *
+                                             mean_of_16x16_blocks[blk_16x16_idx])) >>
+                                           VARIANCE_PRECISION);
+        }
+
+        // 32x32 variances
+        for (int blk_32x32_idx = 0, me_pu_idx = ME_TIER_ZERO_PU_32x32_0; blk_32x32_idx < 4;
+             blk_32x32_idx++, me_pu_idx++) {
+            sb_var[me_pu_idx] = (uint16_t)((mean_of32x32_squared_values_blocks[blk_32x32_idx] -
+                                            (mean_of_32x32_blocks[blk_32x32_idx] *
+                                             mean_of_32x32_blocks[blk_32x32_idx])) >>
+                                           VARIANCE_PRECISION);
+        }
+    }
+    // 64x64 variance
+    sb_var[ME_TIER_ZERO_PU_64x64] = (uint16_t)((mean_of64x64_squared_values_blocks -
+                                                (mean_of_64x64_blocks * mean_of_64x64_blocks)) >>
+                                               VARIANCE_PRECISION);
+}
+
+#if CONFIG_ENABLE_FILM_GRAIN
+static int32_t apply_denoise_2d(SequenceControlSet* scs, PictureParentControlSet* pcs,
+                                EbPictureBufferDesc* inputPicturePointer) {
+    AomDenoiseAndModel*     denoise_and_model;
+    DenoiseAndModelInitData fg_init_data;
+    fg_init_data.encoder_bit_depth    = pcs->enhanced_pic->bit_depth;
+    fg_init_data.encoder_color_format = pcs->enhanced_pic->color_format;
+    fg_init_data.noise_level          = scs->static_config.film_grain_denoise_strength;
+    fg_init_data.width                = pcs->enhanced_pic->width;
+    fg_init_data.height               = pcs->enhanced_pic->height;
+    fg_init_data.y_stride             = pcs->enhanced_pic->y_stride;
+    fg_init_data.u_stride             = pcs->enhanced_pic->u_stride;
+    fg_init_data.v_stride             = pcs->enhanced_pic->v_stride;
+    fg_init_data.denoise_apply        = scs->static_config.film_grain_denoise_apply;
+    fg_init_data.adaptive_film_grain  = scs->static_config.adaptive_film_grain;
+    EB_NEW(denoise_and_model, svt_aom_denoise_and_model_ctor, (EbPtr)&fg_init_data);
+
+    if (svt_aom_denoise_and_model_run(denoise_and_model,
+                                      inputPicturePointer,
+                                      &pcs->frm_hdr.film_grain_params,
+                                      scs->static_config.encoder_bit_depth > EB_EIGHT_BIT)) {}
+
+    EB_DELETE(denoise_and_model);
+
+    return 0;
+}
+
+static EbErrorType denoise_estimate_film_grain(SequenceControlSet* scs, PictureParentControlSet* pcs) {
+    EbErrorType return_error = EB_ErrorNone;
+
+    FrameHeader* frm_hdr = &pcs->frm_hdr;
+
+    EbPictureBufferDesc* input_pic         = pcs->enhanced_pic;
+    frm_hdr->film_grain_params.apply_grain = 0;
+
+    if (scs->static_config.film_grain_denoise_strength) {
+        if (apply_denoise_2d(scs, pcs, input_pic) < 0) {
+            return 1;
+        }
+    }
+
+    return return_error; //todo: add proper error handling
+}
+
+static EbErrorType apply_film_grain_table(SequenceControlSet* scs_ptr, PictureParentControlSet* pcs_ptr) {
+    FrameHeader*  frm_hdr     = &pcs_ptr->frm_hdr;
+    AomFilmGrain* dst_grain   = &frm_hdr->film_grain_params;
+    uint16_t      random_seed = dst_grain->random_seed;
+
+    AomFilmGrain* src_grain = scs_ptr->static_config.fgs_table;
+
+    SVT_MEMCPY(dst_grain, src_grain, sizeof(*dst_grain));
+
+    frm_hdr->film_grain_params.apply_grain        = 1;
+    frm_hdr->film_grain_params.random_seed        = random_seed;
+    scs_ptr->seq_header.film_grain_params_present = 1;
+
+    return EB_ErrorNone;
+}
+#endif
+
+/************************************************
+ * Picture Pre Processing Operations *
+ *** A function that groups all of the Pre proceesing
+ * operations performed on the input picture
+ *** Operations included at this point:
+ ***** Borders preprocessing
+ ***** Denoising
+ ************************************************/
+void svt_aom_picture_pre_processing_operations(PictureParentControlSet* pcs, SequenceControlSet* scs) {
+#if CONFIG_ENABLE_FILM_GRAIN
+    if (scs->static_config.fgs_table) {
+        apply_film_grain_table(scs, pcs);
+    } else if (scs->static_config.film_grain_denoise_strength) {
+        denoise_estimate_film_grain(scs, pcs);
+    }
+#else
+    (void)pcs;
+    (void)scs;
+#endif
+    return;
+}
+
+static void sub_sample_luma_generate_pixel_intensity_histogram_bins(SequenceControlSet*      scs,
+                                                                    PictureParentControlSet* pcs,
+                                                                    EbPictureBufferDesc*     input_pic,
+                                                                    uint64_t* sum_avg_intensity_ttl_regions_luma) {
+    *sum_avg_intensity_ttl_regions_luma = 0;
+    uint32_t region_width               = input_pic->width / scs->picture_analysis_number_of_regions_per_width;
+    uint32_t region_height              = input_pic->height / scs->picture_analysis_number_of_regions_per_height;
+
+    // Loop over regions inside the picture
+    for (uint32_t region_in_picture_width_index = 0;
+         region_in_picture_width_index < scs->picture_analysis_number_of_regions_per_width;
+         region_in_picture_width_index++) { // loop over horizontal regions
+        for (uint32_t region_in_picture_height_index = 0;
+             region_in_picture_height_index < scs->picture_analysis_number_of_regions_per_height;
+             region_in_picture_height_index++) { // loop over vertical regions
+
+            uint64_t sum = 0;
+
+            // Initialize bins to 1
+            svt_initialize_buffer_32bits(
+                pcs->picture_histogram[region_in_picture_width_index][region_in_picture_height_index], 64, 0, 1);
+
+            uint32_t region_width_offset = (region_in_picture_width_index ==
+                                            scs->picture_analysis_number_of_regions_per_width - 1)
+                ? input_pic->width - (scs->picture_analysis_number_of_regions_per_width * region_width)
+                : 0;
+
+            uint32_t region_height_offset = (region_in_picture_height_index ==
+                                             scs->picture_analysis_number_of_regions_per_height - 1)
+                ? input_pic->height - (scs->picture_analysis_number_of_regions_per_height * region_height)
+                : 0;
+            uint8_t  decim_step           = scs->static_config.scene_change_detection ? 1 : 4;
+            // Y Histogram
+            calculate_histogram(
+                &input_pic->y_buffer[(region_in_picture_width_index * region_width) +
+                                     ((region_in_picture_height_index * region_height) * input_pic->y_stride)],
+                region_width + region_width_offset,
+                region_height + region_height_offset,
+                input_pic->y_stride,
+                decim_step,
+                pcs->picture_histogram[region_in_picture_width_index][region_in_picture_height_index],
+                &sum);
+            sum = (sum * decim_step * decim_step);
+
+            pcs->average_intensity_per_region[region_in_picture_width_index][region_in_picture_height_index] =
+                (uint8_t)((sum +
+                           (((region_width + region_width_offset) * (region_height + region_height_offset)) >> 1)) /
+                          ((region_width + region_width_offset) * (region_height + region_height_offset)));
+            *sum_avg_intensity_ttl_regions_luma += sum;
+            for (uint32_t histogram_bin = 0; histogram_bin < HISTOGRAM_NUMBER_OF_BINS;
+                 histogram_bin++) { // Loop over the histogram bins
+                pcs->picture_histogram[region_in_picture_width_index][region_in_picture_height_index][histogram_bin] =
+                    pcs->picture_histogram[region_in_picture_width_index][region_in_picture_height_index]
+                                          [histogram_bin] *
+                    4 * 4 * decim_step * decim_step;
+            }
+        }
+    }
+
+    *sum_avg_intensity_ttl_regions_luma /= (input_pic->width * input_pic->height);
+
+    return;
+}
+
+/************************************************
+ * compute_picture_spatial_statistics
+ ** Compute Block Variance
+ ** Compute Picture Variance
+ ** Compute Block Mean for all blocks in the picture
+ ************************************************/
+static void compute_picture_spatial_statistics(SequenceControlSet* scs, PictureParentControlSet* pcs,
+                                               EbPictureBufferDesc* input_padded_pic) {
+    // Variance
+    uint64_t pic_tot_variance = 0;
+    uint16_t b64_total_count  = pcs->b64_total_count;
+
+    for (uint16_t b64_idx = 0; b64_idx < b64_total_count; ++b64_idx) {
+        B64Geom* b64_geom = &pcs->b64_geom[b64_idx];
+
+        uint16_t b64_origin_x            = b64_geom->org_x; // to avoid using child PCS
+        uint16_t b64_origin_y            = b64_geom->org_y;
+        uint32_t input_luma_origin_index = (b64_origin_y)*input_padded_pic->y_stride + b64_origin_x;
+
+        compute_b64_variance(scs, pcs, input_padded_pic, b64_idx, input_luma_origin_index);
+        pic_tot_variance += (pcs->variance[b64_idx][RASTER_SCAN_CU_INDEX_64x64]);
+    }
+
+    pcs->pic_avg_variance = (uint16_t)(pic_tot_variance / b64_total_count);
+
+    return;
+}
+
+/************************************************
+ * Gathering statistics per picture
+ ** Calculating the pixel intensity histogram bins per picture needed for SCD
+ ** Computing Picture Variance
+ ************************************************/
+void svt_aom_gathering_picture_statistics(SequenceControlSet* scs, PictureParentControlSet* pcs,
+                                          EbPictureBufferDesc* input_padded_pic,
+                                          EbPictureBufferDesc* sixteenth_decimated_picture_ptr) {
+    pcs->avg_luma = INVALID_LUMA;
+    // Histogram bins
+    if (scs->calc_hist) {
+        // Use 1/16 Luma for Histogram generation
+        // 1/16 input ready
+        sub_sample_luma_generate_pixel_intensity_histogram_bins(
+            scs, pcs, sixteenth_decimated_picture_ptr, &pcs->avg_luma);
+    }
+
+    if (scs->calculate_variance) {
+        compute_picture_spatial_statistics(scs, pcs, input_padded_pic);
+    } else {
+        pcs->pic_avg_variance = 0;
+    }
+
+    return;
+}
+
+/*
+    pad the  2b-compressed picture on the right and bottom edges to reach n.8 for Luma and n.4 for Chroma
+*/
+static void pad_2b_compressed_input_picture(uint8_t* src_pic, uint32_t src_stride, uint32_t original_src_width,
+                                            uint32_t original_src_height, uint32_t pad_right, uint32_t pad_bottom) {
+    if (pad_right > 0) {
+        uint8_t  last_byte, last_pixel, new_byte;
+        uint32_t w_m4 = (original_src_width / 4) * 4;
+
+        uint32_t last_col = w_m4 / 4;
+
+        if (pad_right == 7) {
+            for (uint32_t row = 0; row < original_src_height; row++) {
+                last_byte = src_pic[last_col + row * src_stride];
+                last_byte &= 0xc0;
+                last_pixel = (last_byte >> 6) & 0x03;
+
+                new_byte                             = last_byte | (last_pixel << 4) | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + row * src_stride] = new_byte;
+
+                new_byte = (last_pixel << 6) | (last_pixel << 4) | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + 1 + row * src_stride] = new_byte;
+            }
+        } else if (pad_right == 6) {
+            for (uint32_t row = 0; row < original_src_height; row++) {
+                last_byte = src_pic[last_col + row * src_stride];
+                last_byte &= 0xf0;
+                last_pixel = (last_byte >> 4) & 0x03;
+
+                new_byte                             = last_byte | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + row * src_stride] = new_byte;
+
+                new_byte = (last_pixel << 6) | (last_pixel << 4) | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + 1 + row * src_stride] = new_byte;
+            }
+        } else if (pad_right == 5) {
+            for (uint32_t row = 0; row < original_src_height; row++) {
+                last_byte = src_pic[last_col + row * src_stride];
+                last_byte &= 0xfc;
+                last_pixel = (last_byte >> 2) & 0x03;
+
+                new_byte                             = last_byte | last_pixel;
+                src_pic[last_col + row * src_stride] = new_byte;
+
+                new_byte = (last_pixel << 6) | (last_pixel << 4) | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + 1 + row * src_stride] = new_byte;
+            }
+        } else if (pad_right == 4) {
+            for (uint32_t row = 0; row < original_src_height; row++) {
+                last_byte  = src_pic[last_col - 1 + row * src_stride];
+                last_pixel = last_byte & 0x03;
+
+                new_byte = (last_pixel << 6) | (last_pixel << 4) | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + row * src_stride] = new_byte;
+            }
+        } else if (pad_right == 3) {
+            for (uint32_t row = 0; row < original_src_height; row++) {
+                last_byte = src_pic[last_col + row * src_stride];
+                last_byte &= 0xc0;
+                last_pixel = (last_byte >> 6) & 0x03;
+
+                new_byte                             = last_byte | (last_pixel << 4) | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + row * src_stride] = new_byte;
+            }
+        } else if (pad_right == 2) {
+            for (uint32_t row = 0; row < original_src_height; row++) {
+                last_byte = src_pic[last_col + row * src_stride];
+                last_byte &= 0xf0;
+                last_pixel = (last_byte >> 4) & 0x03;
+
+                new_byte                             = last_byte | (last_pixel << 2) | last_pixel;
+                src_pic[last_col + row * src_stride] = new_byte;
+            }
+        } else if (pad_right == 1) {
+            for (uint32_t row = 0; row < original_src_height; row++) {
+                last_byte = src_pic[last_col + row * src_stride];
+                last_byte &= 0xfc;
+                last_pixel = (last_byte >> 2) & 0x03;
+
+                new_byte                             = last_byte | last_pixel;
+                src_pic[last_col + row * src_stride] = new_byte;
+            }
+        } else {
+            svt_aom_assert_err(0, "wrong pad value");
+        }
+    }
+
+    if (pad_bottom) {
+        uint8_t* temp_src_pic0 = src_pic + (original_src_height - 1) * src_stride;
+        for (uint32_t row = 0; row < pad_bottom; row++) {
+            uint8_t* temp_src_pic1 = temp_src_pic0 + (row + 1) * src_stride;
+            svt_memcpy(temp_src_pic1, temp_src_pic0, (original_src_width + pad_right) / 4);
+        }
+    }
+}
+
+/************************************************
+ * Pad Picture at the right and bottom sides
+ ** To match a multiple of min CU size in width and height
+ ************************************************/
+void svt_aom_pad_picture_to_multiple_of_min_blk_size_dimensions(SequenceControlSet*  scs,
+                                                                EbPictureBufferDesc* input_pic) {
+    bool is16_bit_input = scs->static_config.encoder_bit_depth > EB_EIGHT_BIT;
+
+    uint32_t       color_format  = input_pic->color_format;
+    const uint16_t subsampling_x = (color_format == EB_YUV444 ? 0 : 1);
+    const uint16_t subsampling_y = (color_format >= EB_YUV422 ? 0 : 1);
+
+    // Input Picture Padding
+    pad_input_picture(input_pic->y_buffer,
+                      input_pic->y_stride,
+                      (input_pic->width - scs->pad_right),
+                      (input_pic->height - scs->pad_bottom),
+                      scs->pad_right,
+                      scs->pad_bottom);
+
+    if (input_pic->u_buffer) {
+        pad_input_picture(input_pic->u_buffer,
+                          input_pic->u_stride,
+                          (input_pic->width + subsampling_x - scs->pad_right) >> subsampling_x,
+                          (input_pic->height + subsampling_y - scs->pad_bottom) >> subsampling_y,
+                          scs->pad_right >> subsampling_x,
+                          scs->pad_bottom >> subsampling_y);
+    }
+
+    if (input_pic->v_buffer) {
+        pad_input_picture(input_pic->v_buffer,
+                          input_pic->v_stride,
+                          (input_pic->width + subsampling_x - scs->pad_right) >> subsampling_x,
+                          (input_pic->height + subsampling_y - scs->pad_bottom) >> subsampling_y,
+                          scs->pad_right >> subsampling_x,
+                          scs->pad_bottom >> subsampling_y);
+    }
+
+    if (is16_bit_input) {
+        uint32_t comp_stride_y = input_pic->y_stride / 4;
+
+        uint32_t comp_stride_uv = input_pic->u_stride / 4;
+
+        if (input_pic->y_buffer_bit_inc) {
+            pad_2b_compressed_input_picture(input_pic->y_buffer_bit_inc,
+                                            comp_stride_y,
+                                            (input_pic->width - scs->pad_right),
+                                            (input_pic->height - scs->pad_bottom),
+                                            scs->pad_right,
+                                            scs->pad_bottom);
+        }
+
+        if (input_pic->u_buffer_bit_inc) {
+            pad_2b_compressed_input_picture(input_pic->u_buffer_bit_inc,
+                                            comp_stride_uv,
+                                            (input_pic->width + subsampling_x - scs->pad_right) >> subsampling_x,
+                                            (input_pic->height + subsampling_y - scs->pad_bottom) >> subsampling_y,
+                                            scs->pad_right >> subsampling_x,
+                                            scs->pad_bottom >> subsampling_y);
+        }
+
+        if (input_pic->v_buffer_bit_inc) {
+            pad_2b_compressed_input_picture(input_pic->v_buffer_bit_inc,
+                                            comp_stride_uv,
+                                            (input_pic->width + subsampling_x - scs->pad_right) >> subsampling_x,
+                                            (input_pic->height + subsampling_y - scs->pad_bottom) >> subsampling_y,
+                                            scs->pad_right >> subsampling_x,
+                                            scs->pad_bottom >> subsampling_y);
+        }
+    }
+
+    return;
+}
+
+/************************************************
+ * Pad Picture at the right and bottom sides
+ ** To match a multiple of min CU size in width and height
+ ** In the function, pixels are stored in short_ptr
+ ************************************************/
+void svt_aom_pad_picture_to_multiple_of_min_blk_size_dimensions_16bit(SequenceControlSet*  scs,
+                                                                      EbPictureBufferDesc* input_pic) {
+    assert(scs->static_config.encoder_bit_depth > EB_EIGHT_BIT);
+
+    uint32_t      color_format  = input_pic->color_format;
+    const uint8_t subsampling_x = (color_format == EB_YUV444 ? 0 : 1);
+    const uint8_t subsampling_y = ((color_format == EB_YUV444 || color_format == EB_YUV422) ? 0 : 1);
+
+    // Input Picture Padding
+    uint16_t* y_buffer = (uint16_t*)(input_pic->y_buffer);
+    svt_aom_pad_input_picture_16bit(y_buffer,
+                                    input_pic->y_stride,
+                                    (input_pic->width - scs->pad_right),
+                                    (input_pic->height - scs->pad_bottom),
+                                    scs->pad_right,
+                                    scs->pad_bottom);
+
+    uint16_t* u_buffer = (uint16_t*)(input_pic->u_buffer);
+    svt_aom_pad_input_picture_16bit(u_buffer,
+                                    input_pic->u_stride,
+                                    (input_pic->width + subsampling_x - scs->pad_right) >> subsampling_x,
+                                    (input_pic->height + subsampling_y - scs->pad_bottom) >> subsampling_y,
+                                    scs->pad_right >> subsampling_x,
+                                    scs->pad_bottom >> subsampling_y);
+
+    uint16_t* v_buffer = (uint16_t*)(input_pic->v_buffer);
+    svt_aom_pad_input_picture_16bit(v_buffer,
+                                    input_pic->v_stride,
+                                    (input_pic->width + subsampling_x - scs->pad_right) >> subsampling_x,
+                                    (input_pic->height + subsampling_y - scs->pad_bottom) >> subsampling_y,
+                                    scs->pad_right >> subsampling_x,
+                                    scs->pad_bottom >> subsampling_y);
+}
+
+/************************************************
+ * Pad Picture at the right and bottom sides
+ ** To complete border SB smaller than SB size
+ ************************************************/
+void svt_aom_pad_picture_to_multiple_of_sb_dimensions(EbPictureBufferDesc* input_padded_pic) {
+    // Generate Padding
+    svt_aom_generate_padding(input_padded_pic->y_buffer,
+                             input_padded_pic->y_stride,
+                             input_padded_pic->width,
+                             input_padded_pic->height,
+                             input_padded_pic->border,
+                             input_padded_pic->border);
+}
+
+int svt_av1_count_colors_highbd(uint16_t* src, int stride, int rows, int cols, int bit_depth, int* val_count) {
+    assert(bit_depth <= 12);
+    const int max_pix_val = 1 << bit_depth;
+    // const uint16_t *src = CONVERT_TO_SHORTPTR(src8);
+    memset(val_count, 0, max_pix_val * sizeof(val_count[0]));
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const int this_val = src[r * stride + c];
+            assert(this_val < max_pix_val);
+            if (this_val >= max_pix_val) {
+                return 0;
+            }
+            ++val_count[this_val];
+        }
+    }
+    int n = 0;
+    for (int i = 0; i < max_pix_val; ++i) {
+        if (val_count[i]) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+int svt_av1_count_colors(const uint8_t* src, int stride, int rows, int cols, int* val_count) {
+    const int max_pix_val = 1 << 8;
+    memset(val_count, 0, max_pix_val * sizeof(val_count[0]));
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const int this_val = src[r * stride + c];
+            assert(this_val < max_pix_val);
+            ++val_count[this_val];
+        }
+    }
+    int n = 0;
+    for (int i = 0; i < max_pix_val; ++i) {
+        if (val_count[i]) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+bool svt_av1_count_colors_with_threshold(const uint8_t* src, int stride, int rows, int cols, int num_colors_threshold,
+                                         int* num_colors) {
+    bool has_color[1 << 8] = {false};
+    *num_colors            = 0;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const int this_val = src[r * stride + c];
+            if (!has_color[this_val]) {
+                has_color[this_val] = true;
+                (*num_colors)++;
+                if (*num_colors > num_colors_threshold) {
+                    // We're over the threshold, so we can exit early
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// This is used as a reference when computing the source variance for the
+//  purposes of activity masking.
+// Eventually this should be replaced by custom no-reference routines,
+//  which will be faster.
+const uint8_t svt_aom_eb_av1_var_offs[MAX_SB_SIZE] = {
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128};
+
+unsigned int svt_av1_get_sby_perpixel_variance(const AomVarianceFnPtr* fn_ptr, const uint8_t* src,
+                                               int       stride, //const struct Buf2D *ref,
+                                               BlockSize bs) {
+    unsigned int       sse;
+    const unsigned int var =
+        //cpi->fn_ptr[bs].vf(ref->buf, ref->stride, svt_aom_eb_av1_var_offs, 0, &sse);
+        fn_ptr->vf(src, stride, svt_aom_eb_av1_var_offs, 0, &sse);
+    return ROUND_POWER_OF_TWO(var, eb_num_pels_log2_lookup[bs]);
+}
+
+// Check if the number of color of a block is superior to 1 and inferior
+// to a given threshold.
+static bool is_valid_palette_nb_colors(const uint8_t* src, int stride, int rows, int cols, int nb_colors_threshold) {
+    bool has_color[1 << 8]; // Maximum (1 << 8) color levels.
+    memset(has_color, 0, (1 << 8) * sizeof(*has_color));
+    int nb_colors = 0;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const int this_val = src[r * stride + c];
+            if (has_color[this_val] == 0) {
+                has_color[this_val] = 1;
+                nb_colors++;
+                if (nb_colors > nb_colors_threshold) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (nb_colors <= 1) {
+        return false;
+    }
+
+    return true;
+}
+
+// Helper function that finds the dominant value of a block.
+//
+// This function builds a histogram of all 256 possible (8 bit) values, and
+// returns with the value with the greatest count (i.e. the dominant value).
+uint8_t svt_av1_find_dominant_value(const uint8_t* src, int stride, int rows, int cols) {
+    uint32_t value_count[1 << 8]  = {0}; // Maximum (1 << 8) value levels.
+    uint32_t dominant_value_count = 0;
+    uint8_t  dominant_value       = 0;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const uint8_t value = src[r * (ptrdiff_t)stride + c];
+
+            value_count[value]++;
+
+            if (value_count[value] > dominant_value_count) {
+                dominant_value       = value;
+                dominant_value_count = value_count[value];
+            }
+        }
+    }
+
+    return dominant_value;
+}
+
+// Helper function that performs one round of image dilation on a block.
+//
+// This function finds the dominant value (i.e. the value that appears most
+// often within a block), then performs a round of dilation by "extending" all
+// occurrences of the dominant value outwards in all 8 directions (4 sides + 4
+// corners).
+//
+// For a visual example, let:
+//  - D: the dominant value
+//  - [a-p]: different non-dominant values (usually anti-aliased pixels)
+//  - .: the most common non-dominant value
+//
+// Before dilation:       After dilation:
+// . . a b D c d . .     . . D D D D D . .
+// . e f D D D g h .     D D D D D D D D D
+// . D D D D D D D .     D D D D D D D D D
+// . D D D D D D D .     D D D D D D D D D
+// . i j D D D k l .     D D D D D D D D D
+// . . m n D o p . .     . . D D D D D . .
+void svt_av1_dilate_block(const uint8_t* src, int src_stride, uint8_t* dilated, int dilated_stride, int rows,
+                          int cols) {
+    uint8_t dominant_value = svt_av1_find_dominant_value(src, src_stride, rows, cols);
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const uint8_t value = src[r * (ptrdiff_t)src_stride + c];
+
+            dilated[r * (ptrdiff_t)dilated_stride + c] = value;
+        }
+    }
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const uint8_t value = src[r * (ptrdiff_t)src_stride + c];
+
+            if (value == dominant_value) {
+                // Dilate up
+                if (r != 0) {
+                    dilated[(r - 1) * (ptrdiff_t)dilated_stride + c] = value;
+                }
+                // Dilate down
+                if (r != rows - 1) {
+                    dilated[(r + 1) * (ptrdiff_t)dilated_stride + c] = value;
+                }
+                // Dilate left
+                if (c != 0) {
+                    dilated[r * (ptrdiff_t)dilated_stride + (c - 1)] = value;
+                }
+                // Dilate right
+                if (c != cols - 1) {
+                    dilated[r * (ptrdiff_t)dilated_stride + (c + 1)] = value;
+                }
+                // Dilate upper-left corner
+                if (r != 0 && c != 0) {
+                    dilated[(r - 1) * (ptrdiff_t)dilated_stride + (c - 1)] = value;
+                }
+                // Dilate upper-right corner
+                if (r != 0 && c != cols - 1) {
+                    dilated[(r - 1) * (ptrdiff_t)dilated_stride + (c + 1)] = value;
+                }
+                // Dilate lower-left corner
+                if (r != rows - 1 && c != 0) {
+                    dilated[(r + 1) * (ptrdiff_t)dilated_stride + (c - 1)] = value;
+                }
+                // Dilate lower-right corner
+                if (r != rows - 1 && c != cols - 1) {
+                    dilated[(r + 1) * (ptrdiff_t)dilated_stride + (c + 1)] = value;
+                }
+            }
+        }
+    }
+}
+
+typedef struct Sc_AA_Counts {
+    int64_t count_photo;
+    int64_t count_palette;
+    int64_t count_intrabc;
+
+    int region_palette[4];
+    int region_intrabc[4];
+    int region_photo[4];
+} Sc_AA_Counts;
+
+static Sc_AA_Counts svt_aom_sc_AA_collect_counts(EbPictureBufferDesc* input_pic, int blk_w, int blk_h,
+                                                 BlockSize               blk_size, // BLOCK_16X16, BLOCK_8X8
+                                                 const AomVarianceFnPtr* fn_ptr, // &svt_aom_mefn_ptr[blk_size]
+                                                 int complex_initial_color_thresh, int simple_color_thresh,
+                                                 int complex_final_color_thresh, int var_thresh, bool fast_detection,
+                                                 uint8_t* dilated_blk) {
+    Sc_AA_Counts output_counts = {0};
+
+    // Skip every other block and weigh each block twice as much when performing
+    // fast detection
+    const int multiplier = fast_detection ? 2 : 1;
+
+    for (int r = 0; r + blk_h <= input_pic->height; r += blk_h) {
+        // Alternate skipping in a "checkerboard" pattern when performing fast detection
+        const int initial_col = (fast_detection && (r / blk_h) % 2) ? blk_w : 0;
+
+        for (int c = initial_col; c + blk_w <= input_pic->width; c += blk_w * multiplier) {
+            // Identify quadrant for this block (2x2 regions)
+            const int w2        = input_pic->width >> 1;
+            const int h2        = input_pic->height >> 1;
+            const int region_id = ((r >= h2) ? 2 : 0) + ((c >= w2) ? 1 : 0);
+
+            uint8_t* src = input_pic->y_buffer + (r)*input_pic->y_stride + c;
+
+            int  number_of_colors;
+            bool is_palette = false;
+            bool is_photo   = false;
+            bool is_intrabc = false;
+
+            // First, find if the block could be palletized
+            if (svt_av1_count_colors_with_threshold(src,
+                                                    /*stride=*/input_pic->y_stride,
+                                                    /*rows=*/blk_h,
+                                                    /*cols=*/blk_w,
+                                                    complex_initial_color_thresh,
+                                                    &number_of_colors) &&
+                number_of_colors > 1) {
+                if (number_of_colors <= simple_color_thresh) {
+                    // Simple block detected, add to block count with no further processing required
+                    is_palette = true;
+
+                    int var = svt_av1_get_sby_perpixel_variance(fn_ptr, src, input_pic->y_stride, blk_size);
+                    if (var > var_thresh) {
+                        is_intrabc = true;
+                    }
+
+                } else {
+                    // Complex block detected, try to find if it's palettizable
+                    // Dilate block with dominant color, to exclude anti-aliased pixels from final palette count
+                    svt_av1_dilate_block(src,
+                                         input_pic->y_stride,
+                                         dilated_blk,
+                                         /*stride=*/blk_w,
+                                         /*rows=*/blk_h,
+                                         /*cols=*/blk_w);
+
+                    if (svt_av1_count_colors_with_threshold(dilated_blk,
+                                                            /*stride=*/blk_w,
+                                                            /*rows=*/blk_h,
+                                                            /*cols=*/blk_w,
+                                                            complex_final_color_thresh,
+                                                            &number_of_colors)) {
+                        int var = svt_av1_get_sby_perpixel_variance(fn_ptr, src, input_pic->y_stride, blk_size);
+                        if (var > var_thresh) {
+                            is_palette = true;
+                            is_intrabc = true;
+                        }
+                    }
+                }
+            } else {
+                if (number_of_colors > complex_initial_color_thresh) {
+                    is_photo = true;
+                }
+            }
+
+            if (is_palette) {
+                ++output_counts.count_palette;
+                ++output_counts.region_palette[region_id];
+            }
+            if (is_intrabc) {
+                ++output_counts.count_intrabc;
+                ++output_counts.region_intrabc[region_id];
+            }
+            if (is_photo) {
+                ++output_counts.count_photo;
+                ++output_counts.region_photo[region_id];
+            }
+        }
+    }
+    if (fast_detection) {
+        output_counts.count_photo *= multiplier;
+        output_counts.count_palette *= multiplier;
+        output_counts.count_intrabc *= multiplier;
+
+        for (int i = 0; i < 4; ++i) {
+            output_counts.region_photo[i] *= multiplier;
+            output_counts.region_palette[i] *= multiplier;
+            output_counts.region_intrabc[i] *= multiplier;
+        }
+    }
+
+    return output_counts;
+}
+
+// Estimates if the source frame is a candidate to enable palette mode
+// and intra block copy, with an accurate detection of anti-aliased text and
+// graphics.
+//
+// Screen content detection is done by dividing frame's luma plane (Y) into
+// small blocks, counting how many unique colors each block contains and
+// their per-pixel variance, and classifying these blocks into three main
+// categories:
+// 1. Palettizable blocks, low variance (can use palette mode)
+// 2. Palettizable blocks, high variance (can use palette mode and IntraBC)
+// 3. Non palettizable, photo-like blocks (can neither use palette mode nor
+//    IntraBC)
+// Finally, this function decides whether the frame could benefit from
+// enabling palette mode with or without IntraBC, based on the ratio of the
+// three categories mentioned above.
+void svt_aom_is_screen_content_antialiasing_aware(PictureParentControlSet* pcs) {
+    enum {
+        blk_w16    = 16,
+        blk_h16    = 16,
+        blk_area16 = 16 * 16,
+        blk_w8     = 8,
+        blk_h8     = 8,
+        blk_area8  = 8 * 8,
+    };
+
+    const bool fast_detection = pcs->scs->fast_aa_aware_screen_detection_mode;
+    // These threshold values are selected experimentally.
+    // Detects text and glyphs without anti-aliasing, and graphics with a 4-color palette
+    const int simple_color_thresh = 4;
+    // Detects potential text and glyphs with anti-aliasing, and graphics with a more extended color palette
+    const int complex_initial_color_thresh = 40;
+    // Detects text and glyphs with anti-aliasing, and graphics with a more extended color palette
+    const int complex_final_color_thresh = 6;
+    // Counts of blocks with no more than final_color_thresh colors
+    const int var_thresh = 5;
+    // Count of blocks that are candidates for using palette mode
+    int64_t count_palette_16 = 0;
+    int64_t count_palette_8  = 0;
+    // Count of blocks that are candidates for using IntraBC than var_thresh
+    int64_t count_intrabc_16 = 0;
+    int64_t count_intrabc_8  = 0;
+    // Count of "photo-like" blocks (i.e. can't use palette mode or IntraBC)
+    int64_t count_photo_16 = 0;
+
+#if DEBUG_AA_SCM
+    FILE* stats_file;
+    stats_file = fopen("aascrdet.stt", "a");
+
+    fprintf(stats_file, "\n");
+    fprintf(stats_file, "AA-aware screen detection image map legend\n");
+    if (fast_detection) {
+        fprintf(stats_file, "Fast detection enabled\n");
+    }
+    fprintf(stats_file, "-------------------------------------------------------\n");
+    fprintf(stats_file, "S: simple block, high var    C: complex block, high var\n");
+    fprintf(stats_file, "-: simple block, low var     =: complex block, low var \n");
+    fprintf(stats_file, "x: photo-like block          .: non-palettizable block \n");
+    fprintf(stats_file, "(whitespace): solid block                              \n");
+    fprintf(stats_file, "-------------------------------------------------------\n");
+#endif
+    const AomVarianceFnPtr* fn_ptr_16 = &svt_aom_mefn_ptr[BLOCK_16X16];
+    const AomVarianceFnPtr* fn_ptr_8  = &svt_aom_mefn_ptr[BLOCK_8X8];
+
+    uint8_t dilated_blk_16[blk_area16];
+    uint8_t dilated_blk_8[blk_area8];
+
+    EbPictureBufferDesc* input_pic = pcs->enhanced_pic;
+    const int64_t        area      = (int64_t)input_pic->width * input_pic->height;
+
+    Sc_AA_Counts counts_16X16 = svt_aom_sc_AA_collect_counts(input_pic,
+                                                             16,
+                                                             16,
+                                                             BLOCK_16X16,
+                                                             fn_ptr_16,
+                                                             complex_initial_color_thresh,
+                                                             simple_color_thresh,
+                                                             complex_final_color_thresh,
+                                                             var_thresh,
+                                                             fast_detection,
+                                                             dilated_blk_16);
+    count_photo_16            = counts_16X16.count_photo;
+    count_palette_16          = counts_16X16.count_palette;
+    count_intrabc_16          = counts_16X16.count_intrabc;
+
+    // SC_class4, SC_class5
+    const int complex_final_color_thresh_8 = 8;
+    const int var_thresh_8                 = 50;
+
+    Sc_AA_Counts counts_8X8 = svt_aom_sc_AA_collect_counts(input_pic,
+                                                           8,
+                                                           8,
+                                                           BLOCK_8X8,
+                                                           fn_ptr_8,
+                                                           complex_initial_color_thresh,
+                                                           simple_color_thresh,
+                                                           complex_final_color_thresh_8,
+                                                           var_thresh_8,
+                                                           fast_detection,
+                                                           dilated_blk_8);
+
+    count_palette_8 = counts_8X8.count_palette;
+    count_intrabc_8 = counts_8X8.count_intrabc;
+
+    // The threshold values are selected experimentally.
+    // Penalize presence of photo-like blocks (1/16th the weight of a palettizable block)
+    pcs->sc_class0 = ((count_palette_16 - count_photo_16 / 16) * blk_area16 * 10 > area);
+
+    // IntraBC would force loop filters off, so we use more strict rules that also
+    // requires that the block has high variance.
+    // Penalize presence of photo-like blocks (1/16th the weight of a palettizable block)
+    pcs->sc_class1 = pcs->sc_class0 && ((count_intrabc_16 - count_photo_16 / 16) * blk_area16 * 12 > area);
+
+    pcs->sc_class2 = pcs->sc_class1 ||
+        (count_palette_16 * blk_area16 * 15 > area * 4 && count_intrabc_16 * blk_area16 * 30 > area);
+
+    pcs->sc_class3 = pcs->sc_class1 ||
+        (count_palette_16 * blk_area16 * 8 > area && count_intrabc_16 * blk_area16 * 50 > area);
+
+    const int64_t region_area = area >> 2; // area/4 for 2x2 regions
+    int           pass        = 0;
+
+    for (int i = 0; i < 4; ++i) {
+#if OPT_SC_STILL_IMAGE
+        if ((counts_8X8.region_palette[i] * blk_area8 * 10 > region_area) &&
+            (counts_8X8.region_intrabc[i] * blk_area8 * 25 > region_area)) {
+#else
+        if ((counts_8X8.region_palette[i] * blk_area8 * 18 > region_area) &&
+            (counts_8X8.region_intrabc[i] * blk_area8 * 50 > region_area)) {
+#endif
+            pass++;
+        }
+    }
+    pcs->sc_class4 = (pass >= 3) && (count_palette_8 * blk_area8 * 5 > area);
+#if OPT_SC_STILL_IMAGE
+    pcs->sc_class5 = (pass >= 3) &&
+        ((count_palette_8 * blk_area8 * 10 > area) && (count_intrabc_8 * blk_area8 * 23 > area));
+#else
+    pcs->sc_class5 = (pass >= 2) &&
+        ((count_palette_8 * blk_area8 * 18 > area) && (count_intrabc_8 * blk_area8 * 50 > area));
+
+#endif
+#if DEBUG_AA_SCM
+    fprintf(stats_file,
+            "block count palette: %" PRId64 ", count intrabc: %" PRId64 ", count photo: %" PRId64 ", total: %d\n",
+            count_palette,
+            count_intrabc,
+            count_photo,
+            (int)(ceil(input_pic->width / blk_w) * ceil(input_pic->height / blk_h)));
+
+    fprintf(stats_file,
+            "sc palette value: %" PRId64 ", threshold %" PRId64 "\n",
+            (count_palette - count_photo / 16) * blk_area * 10,
+            area);
+
+    fprintf(stats_file,
+            "sc ibc value: %" PRId64 ", threshold %" PRId64 "\n",
+            (count_intrabc - count_photo / 16) * blk_area * 12,
+            area);
+
+    fprintf(stats_file,
+            "is sc_class0: %d, is sc_class1: %d, is sc_class2: %d, "
+            "is sc_class3: %d, is sc_class4: %d, is sc_class5: %d\n",
+            pcs->sc_class0,
+            pcs->sc_class1,
+            pcs->sc_class2,
+            pcs->sc_class3,
+            pcs->sc_class4,
+            pcs->sc_class5);
+#endif
+}
+
+// Estimate if the source frame is screen content, based on the portion of
+// blocks that have no more than 4 (experimentally selected) luma colors.
+void svt_aom_is_screen_content(PictureParentControlSet* pcs) {
+    int blk_w = 16;
+    int blk_h = 16;
+    // These threshold values are selected experimentally.
+    int color_thresh = 4;
+    int var_thresh   = 0;
+    // Counts of blocks with no more than color_thresh colors.
+    int counts_1 = 0;
+    // Counts of blocks with no more than color_thresh colors and variance larger
+    // than var_thresh.
+    int counts_2 = 0;
+
+    const AomVarianceFnPtr* fn_ptr    = &svt_aom_mefn_ptr[BLOCK_16X16];
+    EbPictureBufferDesc*    input_pic = pcs->enhanced_pic;
+
+    for (int r = 0; r + blk_h <= input_pic->height; r += blk_h) {
+        for (int c = 0; c + blk_w <= input_pic->width; c += blk_w) {
+            {
+                uint8_t* src = input_pic->y_buffer + (r)*input_pic->y_stride + c;
+
+                if (is_valid_palette_nb_colors(src, input_pic->y_stride, blk_w, blk_h, color_thresh)) {
+                    ++counts_1;
+                    int var = svt_av1_get_sby_perpixel_variance(fn_ptr, src, input_pic->y_stride, BLOCK_16X16);
+                    if (var > var_thresh) {
+                        ++counts_2;
+                    }
+                }
+            }
+        }
+    }
+
+    // The threshold values are selected experimentally.
+    pcs->sc_class0 = (counts_1 * blk_h * blk_w * 10 > input_pic->width * input_pic->height);
+
+    // IntraBC would force loop filters off, so we use more strict rules that also
+    // requires that the block has high variance.
+    pcs->sc_class1 = pcs->sc_class0 && (counts_2 * blk_h * blk_w * 12 > input_pic->width * input_pic->height);
+
+    pcs->sc_class2 = pcs->sc_class1 ||
+        (counts_1 * blk_h * blk_w * 10 > input_pic->width * input_pic->height * 4 &&
+         counts_2 * blk_h * blk_w * 30 > input_pic->width * input_pic->height);
+
+    pcs->sc_class3 = pcs->sc_class1 ||
+        (counts_1 * blk_h * blk_w * 8 > input_pic->width * input_pic->height &&
+         counts_2 * blk_h * blk_w * 50 > input_pic->width * input_pic->height);
+
+    blk_w = 8;
+    blk_h = 8;
+    // These threshold values are selected experimentally.
+    color_thresh = 4;
+    var_thresh   = 16;
+    // Counts of blocks with no more than color_thresh colors.
+    counts_1 = 0;
+    // Counts of blocks with no more than color_thresh colors and variance larger
+    // than var_thresh.
+    counts_2 = 0;
+    for (int r = 0; r + blk_h <= input_pic->height; r += blk_h) {
+        for (int c = 0; c + blk_w <= input_pic->width; c += blk_w) {
+            {
+                uint8_t* src = input_pic->y_buffer + (r)*input_pic->y_stride + c;
+
+                if (is_valid_palette_nb_colors(src, input_pic->y_stride, blk_w, blk_h, color_thresh)) {
+                    ++counts_1;
+                    int var = svt_av1_get_sby_perpixel_variance(fn_ptr, src, input_pic->y_stride, BLOCK_8X8);
+                    if (var > var_thresh) {
+                        ++counts_2;
+                    }
+                }
+            }
+        }
+    }
+    //pcs->sc_class4 = (counts_1 * blk_h * blk_w * 10 > input_pic->width * input_pic->height) && (counts_2 * blk_h * blk_w * 12 > input_pic->width * input_pic->height);
+    // v0 pcs->sc_class4 = (counts_1 * blk_h * blk_w * 12 > input_pic->width * input_pic->height) && (counts_2 * blk_h * blk_w * 13 > input_pic->width * input_pic->height);
+    pcs->sc_class4 = (counts_1 * blk_h * blk_w * 18 > input_pic->width * input_pic->height) &&
+        (counts_2 * blk_h * blk_w * 20 > input_pic->width * input_pic->height);
+}
+
+#if OPT_LPD1_TX_SKIP_DECISION
+#if OPT_IS_INPUT_LUMA_DOMINANT
+#define FRAME_LUMA_DOMINANT_SAMPLE_STEP 8
+#define FRAME_LUMA_DOMINANT_CORE_THR 16
+#define FRAME_LUMA_DOMINANT_TAIL_THR 18
+#define FRAME_LUMA_DOMINANT_MIN_CORE_PCT 85
+#define FRAME_LUMA_DOMINANT_MIN_TAIL_PCT 95
+#define FRAME_LUMA_DOMINANT_NEUTRAL_THR 6
+#define FRAME_LUMA_DOMINANT_UV_DIFF_THR 4
+#define FRAME_LUMA_DOMINANT_MIN_NEUTRAL_PCT 75
+
+bool svt_aom_is_input_luma_dominant(const EbPictureBufferDesc* input_pic) {
+    if (!input_pic || input_pic->color_format == EB_YUV400 || !input_pic->u_buffer || !input_pic->v_buffer) {
+        return false;
+    }
+
+    const uint32_t uv_w = input_pic->width >> 1;
+    const uint32_t uv_h = input_pic->height >> 1;
+
+    if (!uv_w || !uv_h) {
+        return false;
+    }
+
+    uint32_t sample_cnt  = 0;
+    uint32_t core_cnt    = 0;
+    uint32_t tail_cnt    = 0;
+    uint32_t neutral_cnt = 0;
+
+    const uint32_t core_thr_sq = FRAME_LUMA_DOMINANT_CORE_THR * FRAME_LUMA_DOMINANT_CORE_THR;
+    const uint32_t tail_thr_sq = FRAME_LUMA_DOMINANT_TAIL_THR * FRAME_LUMA_DOMINANT_TAIL_THR;
+
+    for (uint32_t y = 0; y < uv_h; y += FRAME_LUMA_DOMINANT_SAMPLE_STEP) {
+        const uint8_t* const ub = input_pic->u_buffer + y * input_pic->u_stride;
+        const uint8_t* const vb = input_pic->v_buffer + y * input_pic->v_stride;
+
+        for (uint32_t x = 0; x < uv_w; x += FRAME_LUMA_DOMINANT_SAMPLE_STEP) {
+            const int32_t  du            = (int32_t)ub[x] - 128;
+            const int32_t  dv            = (int32_t)vb[x] - 128;
+            const int32_t  uv            = (int32_t)ub[x] - (int32_t)vb[x];
+            const uint32_t chroma_mag_sq = (uint32_t)(du * du + dv * dv);
+            const int32_t  abs_du        = du < 0 ? -du : du;
+            const int32_t  abs_dv        = dv < 0 ? -dv : dv;
+            const int32_t  abs_uv        = uv < 0 ? -uv : uv;
+
+            // Most samples must stay inside a tight near-neutral chroma region,
+            // and almost all samples must stay inside a slightly looser region.
+            if (chroma_mag_sq <= core_thr_sq) {
+                core_cnt++;
+            }
+            if (chroma_mag_sq <= tail_thr_sq) {
+                tail_cnt++;
+            }
+            if (abs_du <= FRAME_LUMA_DOMINANT_NEUTRAL_THR && abs_dv <= FRAME_LUMA_DOMINANT_NEUTRAL_THR &&
+                abs_uv <= FRAME_LUMA_DOMINANT_UV_DIFF_THR) {
+                neutral_cnt++;
+            }
+
+            sample_cnt++;
+        }
+    }
+
+    return sample_cnt && core_cnt * 100 >= sample_cnt * FRAME_LUMA_DOMINANT_MIN_CORE_PCT &&
+        (tail_cnt * 100 >= sample_cnt * FRAME_LUMA_DOMINANT_MIN_TAIL_PCT ||
+         neutral_cnt * 100 >= sample_cnt * FRAME_LUMA_DOMINANT_MIN_NEUTRAL_PCT);
+}
+
+#else
+#define PD_FRAME_GRAYLIKE_SAMPLE_STEP 8
+#define PD_FRAME_GRAYLIKE_NEUTRAL_THR 6
+#define PD_FRAME_GRAYLIKE_UV_DIFF_THR 4
+#define PD_FRAME_GRAYLIKE_MIN_PASS_PCT 75
+
+bool svt_aom_is_input_grayscale_like(const EbPictureBufferDesc* input_pic) {
+    if (!input_pic || input_pic->color_format == EB_YUV400 || !input_pic->u_buffer || !input_pic->v_buffer) {
+        return false;
+    }
+
+    const uint32_t uv_w = input_pic->width >> 1;
+    const uint32_t uv_h = input_pic->height >> 1;
+
+    if (!uv_w || !uv_h) {
+        return false;
+    }
+
+    uint32_t sample_cnt  = 0;
+    uint32_t neutral_cnt = 0;
+
+    for (uint32_t y = 0; y < uv_h; y += PD_FRAME_GRAYLIKE_SAMPLE_STEP) {
+        const uint8_t* const ub = input_pic->u_buffer + y * input_pic->u_stride;
+        const uint8_t* const vb = input_pic->v_buffer + y * input_pic->v_stride;
+
+        for (uint32_t x = 0; x < uv_w; x += PD_FRAME_GRAYLIKE_SAMPLE_STEP) {
+            const int32_t du = (int32_t)ub[x] - 128;
+            const int32_t dv = (int32_t)vb[x] - 128;
+            const int32_t uv = (int32_t)ub[x] - (int32_t)vb[x];
+
+            if ((du < 0 ? -du : du) <= PD_FRAME_GRAYLIKE_NEUTRAL_THR &&
+                (dv < 0 ? -dv : dv) <= PD_FRAME_GRAYLIKE_NEUTRAL_THR &&
+                (uv < 0 ? -uv : uv) <= PD_FRAME_GRAYLIKE_UV_DIFF_THR) {
+                neutral_cnt++;
+            }
+
+            sample_cnt++;
+        }
+    }
+
+    return sample_cnt && (neutral_cnt * 100 >= sample_cnt * PD_FRAME_GRAYLIKE_MIN_PASS_PCT);
+}
+#endif
+#endif
+
+/************************************************
+ * 1/4 & 1/16 input picture downsampling (filtering)
+ ************************************************/
+void svt_aom_downsample_filtering_input_picture(PictureParentControlSet* pcs, EbPictureBufferDesc* input_padded_pic,
+                                                EbPictureBufferDesc* quarter_picture_ptr,
+                                                EbPictureBufferDesc* sixteenth_picture_ptr) {
+    // Downsample input picture for HME L0 and L1
+    if (pcs->enable_hme_flag || pcs->tf_enable_hme_flag) {
+        if (pcs->enable_hme_level1_flag || pcs->tf_enable_hme_level1_flag) {
+            downsample_2d(input_padded_pic->y_buffer,
+                          input_padded_pic->y_stride,
+                          input_padded_pic->width,
+                          input_padded_pic->height,
+                          quarter_picture_ptr->y_buffer,
+                          quarter_picture_ptr->y_stride,
+                          2);
+            svt_aom_generate_padding(quarter_picture_ptr->y_buffer,
+                                     quarter_picture_ptr->y_stride,
+                                     quarter_picture_ptr->width,
+                                     quarter_picture_ptr->height,
+                                     quarter_picture_ptr->border,
+                                     quarter_picture_ptr->border);
+        }
+
+        if (pcs->enable_hme_level0_flag || pcs->tf_enable_hme_level0_flag) {
+            // Sixteenth Input Picture Downsampling
+            if (pcs->enable_hme_level1_flag || pcs->tf_enable_hme_level1_flag) {
+                downsample_2d(quarter_picture_ptr->y_buffer,
+                              quarter_picture_ptr->y_stride,
+                              quarter_picture_ptr->width,
+                              quarter_picture_ptr->height,
+                              sixteenth_picture_ptr->y_buffer,
+                              sixteenth_picture_ptr->y_stride,
+                              2);
+            } else {
+                downsample_2d(input_padded_pic->y_buffer,
+                              input_padded_pic->y_stride,
+                              input_padded_pic->width,
+                              input_padded_pic->height,
+                              sixteenth_picture_ptr->y_buffer,
+                              sixteenth_picture_ptr->y_stride,
+                              4);
+            }
+
+            svt_aom_generate_padding(sixteenth_picture_ptr->y_buffer,
+                                     sixteenth_picture_ptr->y_stride,
+                                     sixteenth_picture_ptr->width,
+                                     sixteenth_picture_ptr->height,
+                                     sixteenth_picture_ptr->border,
+                                     sixteenth_picture_ptr->border);
+        }
+    }
+}
+
+void svt_aom_pad_input_pictures(SequenceControlSet* scs, EbPictureBufferDesc* input_pic) {
+    // Pad pictures to multiple min cu size
+    // For non-8 aligned case, like 426x240, padding to 432x240 first
+    svt_aom_pad_picture_to_multiple_of_min_blk_size_dimensions(scs, input_pic);
+
+    svt_aom_generate_padding(input_pic->y_buffer,
+                             input_pic->y_stride,
+                             input_pic->width,
+                             input_pic->height,
+                             input_pic->border,
+                             input_pic->border);
+
+    uint32_t comp_stride_y  = input_pic->y_stride / 4;
+    uint32_t comp_stride_uv = input_pic->u_stride / 4;
+
+    if (scs->static_config.encoder_bit_depth > EB_EIGHT_BIT) {
+        if (input_pic->y_buffer_bit_inc) {
+            svt_aom_generate_padding_compressed_10bit(input_pic->y_buffer_bit_inc,
+                                                      comp_stride_y,
+                                                      input_pic->width,
+                                                      input_pic->height,
+                                                      input_pic->border,
+                                                      input_pic->border);
+        }
+    }
+
+    // Safe to divide by 2 (input_pic->width >> scs->subsampling_x), with no risk of off-of-one issues
+    // from chroma subsampling as picture is already 8px aligned
+    if (input_pic->u_buffer) {
+        svt_aom_generate_padding(input_pic->u_buffer,
+                                 input_pic->u_stride,
+                                 input_pic->width >> scs->subsampling_x,
+                                 input_pic->height >> scs->subsampling_y,
+                                 input_pic->border >> scs->subsampling_x,
+                                 input_pic->border >> scs->subsampling_y);
+    }
+
+    if (input_pic->v_buffer) {
+        svt_aom_generate_padding(input_pic->v_buffer,
+                                 input_pic->v_stride,
+                                 input_pic->width >> scs->subsampling_x,
+                                 input_pic->height >> scs->subsampling_y,
+                                 input_pic->border >> scs->subsampling_x,
+                                 input_pic->border >> scs->subsampling_y);
+    }
+
+    // PAD the bit inc buffer in 10bit
+    if (scs->static_config.encoder_bit_depth > EB_EIGHT_BIT) {
+        if (input_pic->u_buffer_bit_inc) {
+            svt_aom_generate_padding_compressed_10bit(input_pic->u_buffer_bit_inc,
+                                                      comp_stride_uv,
+                                                      input_pic->width >> scs->subsampling_x,
+                                                      input_pic->height >> scs->subsampling_y,
+                                                      input_pic->border >> scs->subsampling_x,
+                                                      input_pic->border >> scs->subsampling_y);
+        }
+
+        if (input_pic->v_buffer_bit_inc) {
+            svt_aom_generate_padding_compressed_10bit(input_pic->v_buffer_bit_inc,
+                                                      comp_stride_uv,
+                                                      input_pic->width >> scs->subsampling_x,
+                                                      input_pic->height >> scs->subsampling_y,
+                                                      input_pic->border >> scs->subsampling_x,
+                                                      input_pic->border >> scs->subsampling_y);
+        }
+    }
+}
+
+#if OPT_TUNE_VMAF
+/*********************************************************************************
+ *
+ * @brief
+ *  Determines the per-frame unsharp mask sharpening strength for TUNE_VMAF.
+ *
+ * @par Description:
+ *  The strength is assembled from independent signals, each isolated in its own
+ *  helper, then combined:
+ *
+ *  1. vmaf_get_spatial_amount: caps the amount by MAD tiers -- a low floor for
+ *     near-flat frames, then stepping up with activity toward the cap.
+ *
+ *  2. vmaf_get_qp_amount: maps the base encoding QP to a target amount -- full
+ *     strength at low QP, easing down monotonically as QP rises, then holding a
+ *     floor at higher QP, since heavy compression masks fine detail regardless.
+ *
+ *  3. vmaf_get_coherence_factor: reduces the amount on low gradient-coherence
+ *     (noise/grain) frames, which cost the most PSNR per unit VMAF.
+ *
+ *  4. vmaf_compute_combined_amount: pulls the pieces together by blending the
+ *     per-QP and spatial amounts; the coherence factor then scales the result.
+ *
+ ********************************************************************************/
+
+static float vmaf_get_spatial_amount(uint32_t avg_mad) {
+    if (avg_mad < 2) {
+        return 0.15f;
+    } else if (avg_mad < 5) {
+        return 0.22f;
+    } else if (avg_mad < 12) {
+        return 0.28f;
+    } else {
+        return 0.30f;
+    }
+}
+
+static float vmaf_get_qp_amount(uint32_t base_qp) {
+    if (base_qp >= 35) {
+        return 0.3f;
+    }
+    return 0.5f - (base_qp / 35.0f) * (0.5f - 0.3f);
+}
+
+static float vmaf_get_coherence_factor(float gcoh) {
+    if (gcoh < 0.40f) {
+        return 0.80f;
+    } else if (gcoh < 0.60f) {
+        return 0.9f;
+    } else {
+        return 1.0f;
+    }
+}
+
+static float vmaf_compute_combined_amount(PictureParentControlSet* pcs, uint32_t avg_mad, float gcoh) {
+    float per_qp     = vmaf_get_qp_amount(pcs->scs->static_config.qp);
+    float spatial    = vmaf_get_spatial_amount(avg_mad);
+    float coh_factor = vmaf_get_coherence_factor(gcoh);
+
+    float combined_amount = (per_qp + spatial) / 2.0f;
+    return combined_amount * coh_factor;
+}
+
+/*********************************************************************************
+ *
+ * @brief
+ *  Computes a per-frame noise gate multiplier that scales down the sharpening
+ *  amount on noisy frames so the unsharp mask does not amplify noise.
+ *
+ * @par Description:
+ *  Estimates the noise level of the luma plane using a Laplacian-based
+ *  estimator. The raw noise estimate is passed through a log1p compression
+ *  to reduce sensitivity to outliers, then mapped to a gate multiplier in
+ *  the range [gate_floor, 1.0]:
+ *
+ *    - Below gate_start : multiplier = 1.0  (no reduction, clean frame)
+ *    - Between gate_start and gate_end : multiplier decreases linearly
+ *    - Above gate_end   : multiplier = gate_floor (maximum reduction)
+ *
+ *  The resulting multiplier is applied directly to the sharpening amount,
+ *  so noisy frames receive proportionally less sharpening to prevent the
+ *  unsharp mask from amplifying noise instead of enhancing real detail.
+ *
+ ********************************************************************************/
+static float vmaf_get_noise_gate(PictureParentControlSet* pcs) {
+    EbPictureBufferDesc* pic = pcs->enhanced_pic;
+
+    const uint8_t* y          = pic->y_buffer;
+    int32_t        noise_fp16 = svt_estimate_noise_fp16(
+        y, (uint16_t)pic->width, (uint16_t)pic->height, (uint16_t)pic->y_stride);
+    if (noise_fp16 < 0) {
+        return 1.0f;
+    }
+
+    int32_t noise_log1p = svt_aom_noise_log1p_fp16(noise_fp16);
+
+    const int32_t gate_start = 40000;
+    const int32_t gate_end   = 80000;
+    const float   gate_floor = 0.3f;
+
+    if (noise_log1p <= gate_start) {
+        return 1.0f;
+    }
+    if (noise_log1p >= gate_end) {
+        return gate_floor;
+    }
+
+    float t = (float)(noise_log1p - gate_start) / (float)(gate_end - gate_start);
+    return 1.0f - t * (1.0f - gate_floor);
+}
+
+/*********************************************************************************
+ *
+ * @brief
+ *  Computes the per-frame delta clip: the cap on how far the unsharp mask may
+ *  push any single pixel, which limits ringing on strong edges.
+ *
+ * @par Description:
+ *  Starts from a QP-based budget (higher QP / lower bitrate frames tolerate a
+ *  larger delta) and then tightens it on busy frames, where strong edges
+ *  dominate and cost the most PSNR per unit of VMAF gain: it clips 4 below
+ *  qp_delta on busy frames, and uses the full qp_delta otherwise.
+ *
+ ********************************************************************************/
+static int32_t vmaf_get_delta_clip(int32_t base_qp, int busy_frame) {
+    int32_t qp_delta;
+    if (base_qp <= 42) {
+        qp_delta = 8;
+    } else if (base_qp <= 51) {
+        qp_delta = 9;
+    } else if (base_qp <= 57) {
+        qp_delta = 10;
+    } else {
+        qp_delta = 12;
+    }
+
+    return busy_frame ? qp_delta - 4 : qp_delta;
+}
+#endif
+
+#if FTR_TUNE_VMAF
+/*********************************************************************************
+ *
+ * @brief
+ *  Applies a separable cascaded box blur to the luma plane to produce the
+ *  reference blur for the unsharp mask.
+ *
+ * @par Description:
+ *  Uses a separable box blur: instead of a full 2D kernel, the filter is split
+ *  into a horizontal pass that processes each row independently, followed by a
+ *  vertical pass over those outputs. Each direction runs two consecutive box
+ *  stages (steps_x = steps_y = 2); cascading two box filters approximates a
+ *  Gaussian while a running accumulator keeps the cost constant per pixel (no
+ *  multiplies). The horizontal pass stores uint32_t intermediates that the
+ *  vertical pass then smooths into the final blurred plane used by the unsharp
+ *  mask.
+ *
+ ********************************************************************************/
+static void vmaf_box_blur_frame(const uint8_t* luma_plane, int stride, uint8_t* blur_plane, int width, int height,
+                                int16_t* const hring[5]) {
+    const int steps_x = 2;
+    const int steps_y = 2;
+
+    int16_t* r[5] = {hring[0], hring[1], hring[2], hring[3], hring[4]};
+    for (int k = 0; k < 4; k++) {
+        int row = k - steps_y;
+        row     = row < 0 ? 0 : (row >= height ? height - 1 : row);
+        svt_vmaf_hpass_row(luma_plane + (size_t)row * stride, width, r[k]);
+    }
+
+    for (int m = 0; m < height; m++) {
+        int row = m + steps_y;
+        row     = row >= height ? height - 1 : row;
+        svt_vmaf_hpass_row(luma_plane + (size_t)row * stride, width, r[4]);
+
+        svt_vmaf_vpass_row(r[0], r[1], r[2], r[3], r[4], blur_plane + (size_t)m * width, width, steps_x);
+
+        int16_t* oldest = r[0];
+        r[0]            = r[1];
+        r[1]            = r[2];
+        r[2]            = r[3];
+        r[3]            = r[4];
+        r[4]            = oldest;
+    }
+}
+
+/*********************************************************************************
+ * Inspired by libaom's unsharp_rect() in av1/encoder/tune_vmaf.c
+ *
+ * @brief
+ *  Applies the unsharp mask to the full luma plane row by row.
+ *
+ * @par Description:
+ *  For each row, computes the detail signal as the difference between the
+ *  original and blurred luma, scales it by the sharpening amount, and adds it
+ *  back to the original. Before scaling, the per-pixel delta is clamped to
+ *  delta_clip to limit ringing and distortion on strong edges. The result is
+ *  written directly into the destination buffer.
+ *
+ ********************************************************************************/
+static void vmaf_unsharp_apply_frame(const uint8_t* src, const uint8_t* blur_plane, uint8_t* dst, int width, int height,
+                                     int stride, int sharp_amount, int32_t delta_clip) {
+    for (int y = 0; y < height; y++) {
+        svt_vmaf_apply_unsharp_row(
+            src + y * stride, blur_plane + y * width, dst + y * stride, width, sharp_amount, delta_clip);
+    }
+}
+
+/*********************************************************************************
+ *
+ * @brief
+ *  Entry point for the TUNE_VMAF luma preprocessing pipeline applied once
+ *  per input frame before encoding.
+ *
+ * @par Description:
+ *  Runs the full preprocessing sequence on the luma plane, all in place:
+ *    1. Computes the adaptive sharpening amount from the per-QP, spatial-
+ *       activity and gradient-coherence signals, then scales it down with the
+ *       noise gate on noisy frames.
+ *    2. Blurs the luma with vmaf_box_blur_frame to build the low-pass
+ *       reference the unsharp mask needs.
+ *    3. Derives the per-pixel delta clip with vmaf_get_delta_clip, from the
+ *       QP and how busy the frame is, to bound PSNR loss on strong edges.
+ *    4. Applies the unsharp mask with vmaf_unsharp_apply_frame, writing the
+ *       sharpened luma back over the source.
+ *
+ ********************************************************************************/
+static void vmaf_preprocess_frame(PictureAnalysisContext* pa_ctx, PictureParentControlSet* pcs) {
+    EbPictureBufferDesc* pic_ptr    = pcs->enhanced_pic;
+    const int            pic_width  = pic_ptr->width;
+    const int            pic_height = pic_ptr->height;
+    const int            y_stride   = pic_ptr->y_stride;
+
+    /* Step 1: compute the per-frame sharpening amount, then gate it down on noisy frames. */
+    uint32_t avg_mad      = svt_vmaf_compute_avg_mad(pic_ptr->y_buffer, pic_width, pic_height, y_stride);
+    float    gcoh         = svt_vmaf_compute_gradient_coherence(pic_ptr->y_buffer, pic_width, pic_height, y_stride);
+    int      sharp_amount = (int)(vmaf_compute_combined_amount(pcs, avg_mad, gcoh) * 32768.0f);
+    sharp_amount          = (int)(sharp_amount * vmaf_get_noise_gate(pcs));
+    pcs->vmaf_sharpening_amount = sharp_amount;
+
+    /* Step 2: build the low-pass reference by box-blurring the luma plane. */
+    const int padded_width = pic_width + 2 * 2; /* 2 * steps_x */
+    if (pa_ctx->vmaf_padded_w < padded_width) {
+        for (int i = 0; i < 5; i++) {
+            EB_FREE_ARRAY(pa_ctx->vmaf_hring[i]);
+        }
+        pa_ctx->vmaf_padded_w = 0;
+        for (int i = 0; i < 5; i++) {
+            EB_MALLOC_ARRAY_NO_CHECK(pa_ctx->vmaf_hring[i], padded_width);
+        }
+        if (!pa_ctx->vmaf_hring[0] || !pa_ctx->vmaf_hring[1] || !pa_ctx->vmaf_hring[2] || !pa_ctx->vmaf_hring[3] ||
+            !pa_ctx->vmaf_hring[4]) {
+            return;
+        }
+        pa_ctx->vmaf_padded_w = padded_width;
+    }
+
+    const int blur_pixels = pic_width * pic_height;
+    if (pa_ctx->vmaf_blur_pixels < blur_pixels) {
+        EB_FREE_ARRAY(pa_ctx->vmaf_blur_plane);
+        pa_ctx->vmaf_blur_pixels = 0;
+        EB_MALLOC_ARRAY_NO_CHECK(pa_ctx->vmaf_blur_plane, (size_t)blur_pixels);
+        if (!pa_ctx->vmaf_blur_plane) {
+            return;
+        }
+        pa_ctx->vmaf_blur_pixels = blur_pixels;
+    }
+
+    uint8_t* luma       = pic_ptr->y_buffer;
+    uint8_t* blur_plane = pa_ctx->vmaf_blur_plane;
+    vmaf_box_blur_frame(luma, y_stride, blur_plane, pic_width, pic_height, pa_ctx->vmaf_hring);
+
+    /* Step 3: flag busy frames (under 85% flat pixels) and derive the per-pixel delta clip. */
+    const int32_t  flat_detail_thr   = 12;
+    const uint32_t pixel_count       = (uint32_t)(pic_width * pic_height);
+    const uint32_t flat_pixel_target = pixel_count * 85 / 100;
+    const uint32_t flat_pixel_count  = svt_vmaf_count_detail_le(
+        luma, blur_plane, pic_width, pic_height, y_stride, flat_detail_thr);
+    const int is_busy_frame = (flat_pixel_count < flat_pixel_target);
+
+    const int32_t delta_clip = vmaf_get_delta_clip((int32_t)pcs->scs->static_config.qp, is_busy_frame);
+    pcs->vmaf_max_delta      = delta_clip;
+
+    /* Step 4: apply the unsharp mask in place, writing the sharpened luma back over the source. */
+    vmaf_unsharp_apply_frame(luma, blur_plane, luma, pic_width, pic_height, y_stride, sharp_amount, delta_clip);
+}
+#endif
+
+/* Picture Analysis Kernel */
+
+/*********************************************************************************
+ *
+ * @brief
+ *  The Picture Analysis processes perform the first stage of encoder pre-processing analysis
+ *  as well as any intra-picture image conversion procedures, such as resampling, color space
+ *conversion, or tone mapping.
+ *
+ * @par Description:
+ *  The Picture Analysis processes can be multithreaded and as such can process multiple input
+ *pictures at a time. The Picture Analysis also includes creating an n-bin Histogram, gathering 1st
+ *and 2nd moment statistics for each 8x8 block in the picture, which are used in variance
+ *calculations. Since the Picture Analysis process is multithreaded, the pictures can be processed
+ *out of order as long as all image-modifying functions are completed before any
+ *  statistics-gathering functions begin.
+ *
+ * @param[in] Pictures
+ *  The Picture Analysis Kernel performs pre-processing analysis as well as any intra-picture image
+ *conversion, color space conversion or tone mapping on the pictures that it was given.
+ *
+ * @param[out] statistics
+ *  n-bin histogram is created to gather 1st and 2nd moment statistics for each 8x8 block which is
+ *then used to compute statistics
+ *
+ ********************************************************************************/
+EbErrorType svt_aom_picture_analysis_kernel_iter(void* context) {
+    PictureAnalysisContext*  pa_ctx = (PictureAnalysisContext*)context;
+    PictureParentControlSet* pcs;
+
+    EbObjectWrapper*             in_results_wrapper_ptr;
+    ResourceCoordinationResults* in_results_ptr;
+    EbObjectWrapper*             out_results_wrapper;
+    EbPaReferenceObject*         pa_ref_obj_;
+
+    EbPictureBufferDesc* input_pic;
+
+    // Get Input Full Object
+    EB_GET_FULL_OBJECT(pa_ctx->resource_coordination_results_input_fifo_ptr, &in_results_wrapper_ptr);
+
+    in_results_ptr = (ResourceCoordinationResults*)in_results_wrapper_ptr->object_ptr;
+    pcs            = (PictureParentControlSet*)in_results_ptr->pcs_wrapper->object_ptr;
+
+#if OPT_LPD1_TX_SKIP_DECISION
+#if OPT_IS_INPUT_LUMA_DOMINANT
+    pcs->is_luma_dominant_input = false;
+#else
+    pcs->is_grayscale_like_input = false;
+#endif
+#endif
+
+    // Mariana : save enhanced picture ptr, move this from here
+    pcs->enhanced_unscaled_pic = pcs->enhanced_pic;
+
+    // There is no need to do processing for overlay picture. Overlay and AltRef share the same
+    // results.
+    if (!pcs->is_overlay) {
+        SequenceControlSet* scs = pcs->scs;
+        input_pic               = pcs->enhanced_pic;
+        EbPictureBufferDesc* input_padded_pic;
+        {
+#if FTR_TUNE_VMAF
+            if (scs->static_config.tune == TUNE_VMAF) {
+                vmaf_preprocess_frame(pa_ctx, pcs);
+            }
+#endif
+            // Padding for input pictures
+            svt_aom_pad_input_pictures(scs, input_pic);
+
+            // Pre processing operations performed on the input picture
+            svt_aom_picture_pre_processing_operations(pcs, scs);
+
+            if (input_pic->color_format >= EB_YUV422) {
+                // Jing: Do the conversion of 422/444=>420 here since it's multi-threaded kernel
+                //       Reuse the Y, only add cb/cr in the newly created buffer desc
+                //       NOTE: since denoise may change the src, so this part is after svt_aom_picture_pre_processing_operations()
+                pcs->chroma_downsampled_pic->y_buffer = input_pic->y_buffer;
+                svt_aom_down_sample_chroma(input_pic, pcs->chroma_downsampled_pic);
+            } else {
+                pcs->chroma_downsampled_pic = input_pic;
+            }
+
+            //not passing through the DS pool, so 1/4 and 1/16 are not used
+            pcs->ds_pics.picture_ptr           = input_pic;
+            pcs->ds_pics.quarter_picture_ptr   = NULL;
+            pcs->ds_pics.sixteenth_picture_ptr = NULL;
+            pcs->ds_pics.picture_number        = pcs->picture_number;
+
+            // Original path
+            // Get PA ref, copy 8bit luma to pa_ref->input_padded_pic
+            pa_ref_obj_                 = (EbPaReferenceObject*)pcs->pa_ref_pic_wrapper->object_ptr;
+            pa_ref_obj_->picture_number = pcs->picture_number;
+            input_padded_pic            = pa_ref_obj_->input_padded_pic;
+            if (!scs->allintra) {
+                // 1/4 & 1/16 input picture downsampling through filtering
+                svt_aom_downsample_filtering_input_picture(pcs,
+                                                           input_padded_pic,
+                                                           pa_ref_obj_->quarter_downsampled_picture_ptr,
+                                                           pa_ref_obj_->sixteenth_downsampled_picture_ptr);
+
+                pcs->ds_pics.quarter_picture_ptr   = pa_ref_obj_->quarter_downsampled_picture_ptr;
+                pcs->ds_pics.sixteenth_picture_ptr = pa_ref_obj_->sixteenth_downsampled_picture_ptr;
+            }
+        }
+        // Gathering statistics of input picture, including Variance Calculation, Histogram Bins
+        {
+            svt_aom_gathering_picture_statistics(
+                scs, pcs, input_padded_pic, pa_ref_obj_->sixteenth_downsampled_picture_ptr);
+
+            pa_ref_obj_->avg_luma = pcs->avg_luma;
+        }
+
+        // If running multi-threaded mode, perform SC detection in svt_aom_picture_analysis_kernel, else in svt_aom_picture_decision_kernel
+        if (scs->static_config.level_of_parallelism != 1) {
+            switch (scs->static_config.screen_content_mode) {
+#if OPT_SC_STILL_IMAGE
+            case 0:
+                pcs->sc_class0 = pcs->sc_class1 = pcs->sc_class2 = pcs->sc_class3 = pcs->sc_class4 = pcs->sc_class5 = 0;
+                break;
+            case 1:
+                pcs->sc_class0 = pcs->sc_class1 = pcs->sc_class2 = pcs->sc_class3 = pcs->sc_class4 = pcs->sc_class5 = 1;
+                break;
+#else
+            case 0:
+                pcs->sc_class0 = pcs->sc_class1 = pcs->sc_class2 = pcs->sc_class3 = pcs->sc_class4 = 0;
+                break;
+            case 1:
+                pcs->sc_class0 = pcs->sc_class1 = pcs->sc_class2 = pcs->sc_class3 = pcs->sc_class4 = 1;
+                break;
+#endif
+            case 2:
+                // SC Detection is OFF for 4K and higher
+                if (scs->input_resolution <= INPUT_SIZE_1080p_RANGE) {
+                    svt_aom_is_screen_content(pcs);
+                }
+                break;
+            case 3:
+                svt_aom_is_screen_content_antialiasing_aware(pcs);
+                break;
+            }
+#if OPT_LPD1_TX_SKIP_DECISION
+#if OPT_IS_INPUT_LUMA_DOMINANT
+            // Luma-dominant detection in MT mode
+            if (scs->detect_luma_dominant_input) {
+                pcs->is_luma_dominant_input = svt_aom_is_input_luma_dominant(pcs->chroma_downsampled_pic);
+            }
+#else
+            // Grayscale-like detection in MT mode
+            if (scs->detect_grayscale_like_input) {
+                pcs->is_grayscale_like_input = svt_aom_is_input_grayscale_like(pcs->chroma_downsampled_pic);
+            }
+#endif
+#endif
+        }
+    }
+
+    // Get Empty Results Object
+    svt_get_empty_object(pa_ctx->picture_analysis_results_output_fifo_ptr, &out_results_wrapper);
+
+    PictureAnalysisResults* out_results = (PictureAnalysisResults*)out_results_wrapper->object_ptr;
+    out_results->pcs_wrapper            = in_results_ptr->pcs_wrapper;
+
+    // Release the Input Results
+    svt_release_object(in_results_wrapper_ptr);
+
+    // Post the Full Results Object
+    svt_post_full_object(out_results_wrapper);
+
+    return EB_ErrorNone;
+}
+
+void* svt_aom_picture_analysis_kernel(void* input_ptr) {
+    EbThreadContext* thread_ctx = (EbThreadContext*)input_ptr;
+    for (;;) {
+        EbErrorType err = svt_aom_picture_analysis_kernel_iter(thread_ctx->priv);
+        if (err == EB_NoErrorFifoShutdown) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
