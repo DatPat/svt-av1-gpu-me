@@ -12,13 +12,13 @@ layout(local_size_x = 256) in;
 layout(std430, set = 0, binding = 0) readonly buffer Planes { uint planes[]; }; // full pool
 layout(std430, set = 0, binding = 1) readonly buffer MvIn { uint mvL1[]; };
 layout(std430, set = 0, binding = 2) buffer Results { uint results[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Desc { uint desc[]; };
 
 layout(push_constant) uniform PC {
-    uint srcOff;
-    uint refOff;
     uint w, h;
     uint cols;
-    uint resOff; // word offset of this pair's result region
+    uint blocks;
+    uint u0, u1;
 } pc;
 
 const int RANGE = 8;
@@ -46,6 +46,10 @@ uint svt16Idx(uint x16, uint y16) {
 
 void main() {
     uint blk = gl_WorkGroupID.x;
+    uint pairIdx = gl_WorkGroupID.y;
+    uint srcOff = desc[pairIdx * 8u + 4u];
+    uint refOff = desc[pairIdx * 8u + 5u];
+    uint resOff = desc[pairIdx * 8u + 6u];
     int bx = int(blk % pc.cols) * 64;
     int by = int(blk / pc.cols) * 64;
     uint tid = gl_LocalInvocationID.x;
@@ -54,11 +58,11 @@ void main() {
 
     for (uint i = tid; i < 1024u; i += 256u) {
         uint r = i >> 4, c = i & 15u;
-        srcSh[i] = planes[pc.srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
+        srcSh[i] = planes[srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
     }
     barrier();
 
-    uint l1 = mvL1[blk];
+    uint l1 = mvL1[pairIdx * pc.blocks + blk];
     int pcx = unpackMvX(l1) * 2, pcy = unpackMvY(l1) * 2;
     int lox = -bx, hix = int(pc.w) - 64 - bx;
     int loy = -by, hiy = int(pc.h) - 64 - by;
@@ -91,7 +95,7 @@ void main() {
             uint sh = (o0 & 3u) * 8u;
             for (uint y = 0u; y < 8u; y++) {
                 uint o = o0 + y * pc.w;
-                uint wi = pc.refOff + (o >> 2u);
+                uint wi = refOff + (o >> 2u);
                 uint w0 = planes[wi], w1 = planes[wi + 1u], w2 = planes[wi + 2u];
                 uint r0 = sh == 0u ? w0 : (w0 >> sh) | (w1 << (32u - sh));
                 uint r1 = sh == 0u ? w1 : (w1 >> sh) | (w2 << (32u - sh));
@@ -152,7 +156,7 @@ void main() {
             uint r = tid - 21u, x8 = r & 7u, y8 = r >> 3u;
             svt = 21u + svt16Idx(x8 >> 1u, y8 >> 1u) * 4u + (y8 & 1u) * 2u + (x8 & 1u);
         }
-        uint outBase = pc.resOff + blk * 170u;
+        uint outBase = resOff + blk * 170u;
         results[outBase + svt] = k >> 10;    // sad[85] first
         results[outBase + 85u + svt] = mv;   // then mv[85]
     }

@@ -5,14 +5,14 @@
 layout(local_size_x = 128) in;
 
 layout(std430, set = 0, binding = 0) readonly buffer Planes { uint planes[]; }; // sixteenth pool
-layout(std430, set = 0, binding = 1) buffer MvOut { uint mvOut[]; };            // lane mvL0, blocks entries
+layout(std430, set = 0, binding = 1) buffer MvOut { uint mvOut[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Desc { uint desc[]; }; // 8 words per pair
 
 layout(push_constant) uniform PC {
-    uint srcOff; // word offset of source sixteenth plane
-    uint refOff; // word offset of reference sixteenth plane
     uint w, h;   // sixteenth dims
     uint cols;   // b64 columns
-    uint unused;
+    uint blocks; // b64 blocks per frame
+    uint u0, u1;
 } pc;
 
 const int RANGE = 16;
@@ -29,13 +29,16 @@ uint sad4(uint a, uint b) {
 
 void main() {
     uint blk = gl_WorkGroupID.x;
+    uint pairIdx = gl_WorkGroupID.y;
+    uint srcOff = desc[pairIdx * 8u + 0u];
+    uint refOff = desc[pairIdx * 8u + 1u];
     int bx = int(blk % pc.cols) * 16;
     int by = int(blk / pc.cols) * 16;
     uint tid = gl_LocalInvocationID.x;
 
     if (tid < 64u) {
         uint r = tid >> 2, c = tid & 3u;
-        srcSh[tid] = planes[pc.srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
+        srcSh[tid] = planes[srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
     }
     barrier();
 
@@ -52,7 +55,7 @@ void main() {
         uint o0 = (uint(by + dy)) * pc.w + uint(bx + dx);
         uint sh = (o0 & 3u) * 8u;
         for (uint y = 0u; y < 16u; y++) {
-            uint wi = pc.refOff + ((o0 + y * pc.w) >> 2u);
+            uint wi = refOff + ((o0 + y * pc.w) >> 2u);
             uint prev = planes[wi];
             for (uint wI = 0u; wI < 4u; wI++) {
                 uint nxt = planes[wi + wI + 1u];
@@ -74,6 +77,6 @@ void main() {
         uint pos = shKey[0] & 0x7FFu;
         int dx = x0 + int(pos) % nx;
         int dy = y0 + int(pos) / nx;
-        mvOut[blk] = (uint(dy) & 0xFFFFu) << 16 | (uint(dx) & 0xFFFFu);
+        mvOut[pairIdx * pc.blocks + blk] = (uint(dy) & 0xFFFFu) << 16 | (uint(dx) & 0xFFFFu);
     }
 }

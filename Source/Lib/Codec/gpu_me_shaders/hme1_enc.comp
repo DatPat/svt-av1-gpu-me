@@ -5,13 +5,13 @@ layout(local_size_x = 128) in;
 layout(std430, set = 0, binding = 0) readonly buffer Planes { uint planes[]; }; // quarter pool
 layout(std430, set = 0, binding = 1) readonly buffer MvIn { uint mvL0[]; };
 layout(std430, set = 0, binding = 2) buffer MvOut { uint mvL1[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Desc { uint desc[]; };
 
 layout(push_constant) uniform PC {
-    uint srcOff;
-    uint refOff;
     uint w, h;
     uint cols;
-    uint unused;
+    uint blocks;
+    uint u0, u1;
 } pc;
 
 const int RANGE = 4;
@@ -31,17 +31,20 @@ int unpackMvY(uint m) { return int(m) >> 16; }
 
 void main() {
     uint blk = gl_WorkGroupID.x;
+    uint pairIdx = gl_WorkGroupID.y;
+    uint srcOff = desc[pairIdx * 8u + 2u];
+    uint refOff = desc[pairIdx * 8u + 3u];
     int bx = int(blk % pc.cols) * 32;
     int by = int(blk / pc.cols) * 32;
     uint tid = gl_LocalInvocationID.x;
 
     for (uint i = tid; i < 256u; i += 128u) {
         uint r = i >> 3, c = i & 7u;
-        srcSh[i] = planes[pc.srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
+        srcSh[i] = planes[srcOff + ((uint(by) + r) * pc.w + uint(bx)) / 4u + c];
     }
     barrier();
 
-    uint l0 = mvL0[blk];
+    uint l0 = mvL0[pairIdx * pc.blocks + blk];
     int cx = unpackMvX(l0) * 2, cy = unpackMvY(l0) * 2;
     int lox = -bx, hix = int(pc.w) - 32 - bx;
     int loy = -by, hiy = int(pc.h) - 32 - by;
@@ -58,7 +61,7 @@ void main() {
         uint o0 = (uint(by + dy)) * pc.w + uint(bx + dx);
         uint sh = (o0 & 3u) * 8u;
         for (uint y = 0u; y < 32u; y++) {
-            uint wi = pc.refOff + ((o0 + y * pc.w) >> 2u);
+            uint wi = refOff + ((o0 + y * pc.w) >> 2u);
             uint prev = planes[wi];
             for (uint wI = 0u; wI < 8u; wI++) {
                 uint nxt = planes[wi + wI + 1u];
@@ -80,6 +83,6 @@ void main() {
         uint pos = shKey[0] & 0x7Fu;
         int dx = x0 + int(pos) % nx;
         int dy = y0 + int(pos) / nx;
-        mvL1[blk] = (uint(dy) & 0xFFFFu) << 16 | (uint(dx) & 0xFFFFu);
+        mvL1[pairIdx * pc.blocks + blk] = (uint(dy) & 0xFFFFu) << 16 | (uint(dx) & 0xFFFFu);
     }
 }

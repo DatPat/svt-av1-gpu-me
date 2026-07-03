@@ -68,7 +68,7 @@ struct Lane {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer searchCb = VK_NULL_HANDLE, uploadCb = VK_NULL_HANDLE;
     VkFence searchFence = VK_NULL_HANDLE, uploadFence = VK_NULL_HANDLE;
-    VkBuf mvL0, mvL1, results;
+    VkBuf mvL0, mvL1, results, desc;
     VkDescriptorSet hme0Set = VK_NULL_HANDLE, hme1Set = VK_NULL_HANDLE, fpSet = VK_NULL_HANDLE;
 };
 
@@ -311,9 +311,9 @@ bool initContext(int w, int h) {
     VKC(vkCreateDescriptorPool(g_ctx.dev, &dpi, nullptr, &g_ctx.descPool));
 
     if (!createPipe(downsample_enc_spv, sizeof(downsample_enc_spv), 2, g_ctx.dsPipe)) return false;
-    if (!createPipe(hme0_enc_spv, sizeof(hme0_enc_spv), 2, g_ctx.hme0Pipe)) return false;
-    if (!createPipe(hme1_enc_spv, sizeof(hme1_enc_spv), 3, g_ctx.hme1Pipe)) return false;
-    if (!createPipe(fullpel_enc_spv, sizeof(fullpel_enc_spv), 3, g_ctx.fpPipe)) return false;
+    if (!createPipe(hme0_enc_spv, sizeof(hme0_enc_spv), 3, g_ctx.hme0Pipe)) return false;
+    if (!createPipe(hme1_enc_spv, sizeof(hme1_enc_spv), 4, g_ctx.hme1Pipe)) return false;
+    if (!createPipe(fullpel_enc_spv, sizeof(fullpel_enc_spv), 4, g_ctx.fpPipe)) return false;
 
     g_ctx.dsSetA = makeSet(g_ctx.dsPipe, {g_ctx.fullPool.buf, g_ctx.quarterPool.buf});
     g_ctx.dsSetB = makeSet(g_ctx.dsPipe, {g_ctx.quarterPool.buf, g_ctx.sixteenthPool.buf});
@@ -337,12 +337,13 @@ bool initContext(int w, int h) {
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         VKC(vkCreateFence(g_ctx.dev, &fci, nullptr, &L.searchFence));
         VKC(vkCreateFence(g_ctx.dev, &fci, nullptr, &L.uploadFence));
-        if (!createBuf(4ull * g_ctx.blocks, L.mvL0, false)) return false;
-        if (!createBuf(4ull * g_ctx.blocks, L.mvL1, false)) return false;
+        if (!createBuf(4ull * g_ctx.blocks * GPU_ME_MAX_REFS, L.mvL0, false)) return false;
+        if (!createBuf(4ull * g_ctx.blocks * GPU_ME_MAX_REFS, L.mvL1, false)) return false;
         if (!createBuf(4ull * RESULT_WORDS * g_ctx.blocks * GPU_ME_MAX_REFS, L.results, true)) return false;
-        L.hme0Set = makeSet(g_ctx.hme0Pipe, {g_ctx.sixteenthPool.buf, L.mvL0.buf});
-        L.hme1Set = makeSet(g_ctx.hme1Pipe, {g_ctx.quarterPool.buf, L.mvL0.buf, L.mvL1.buf});
-        L.fpSet = makeSet(g_ctx.fpPipe, {g_ctx.fullPool.buf, L.mvL1.buf, L.results.buf});
+        if (!createBuf(4ull * 8 * GPU_ME_MAX_REFS, L.desc, false)) return false;
+        L.hme0Set = makeSet(g_ctx.hme0Pipe, {g_ctx.sixteenthPool.buf, L.mvL0.buf, L.desc.buf});
+        L.hme1Set = makeSet(g_ctx.hme1Pipe, {g_ctx.quarterPool.buf, L.mvL0.buf, L.mvL1.buf, L.desc.buf});
+        L.fpSet = makeSet(g_ctx.fpPipe, {g_ctx.fullPool.buf, L.mvL1.buf, L.results.buf, L.desc.buf});
         if (!L.hme0Set || !L.hme1Set || !L.fpSet) return false;
     }
     atexit(reportStats);
@@ -502,40 +503,46 @@ extern "C" void* svt_gpu_me_acquire(const uint8_t* src_y, int src_stride, uint64
                 bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
                 ok = ok && vkBeginCommandBuffer(L.searchCb, &bi) == VK_SUCCESS;
                 if (ok) {
-                    uint32_t qw = (uint32_t)g_ctx.padW / 2, qh = (uint32_t)g_ctx.padH / 2;
-                    uint32_t sw = (uint32_t)g_ctx.padW / 4, shh = (uint32_t)g_ctx.padH / 4;
+                    // Per-pair slot offsets via the lane's desc SSBO; all
+                    // pairs run in one grid.y-batched dispatch per stage.
+                    uint32_t* dw = (uint32_t*)L.desc.map;
                     for (int sl = 0; sl < launched; sl++) {
                         int rs = refSlot[sl];
-                        PushConsts p0 = {(uint32_t)(g_ctx.sSlotWords * srcSlot), (uint32_t)(g_ctx.sSlotWords * rs),
-                                         sw, shh, (uint32_t)g_ctx.cols, 0};
-                        vkCmdBindPipeline(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme0Pipe.pipe);
-                        vkCmdBindDescriptorSets(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme0Pipe.layout,
-                                                0, 1, &L.hme0Set, 0, nullptr);
-                        vkCmdPushConstants(L.searchCb, g_ctx.hme0Pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                           sizeof(p0), &p0);
-                        vkCmdDispatch(L.searchCb, g_ctx.blocks, 1, 1);
-                        barrierCompute(L.searchCb);
-                        PushConsts p1 = {(uint32_t)(g_ctx.qSlotWords * srcSlot), (uint32_t)(g_ctx.qSlotWords * rs),
-                                         qw, qh, (uint32_t)g_ctx.cols, 0};
-                        vkCmdBindPipeline(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme1Pipe.pipe);
-                        vkCmdBindDescriptorSets(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme1Pipe.layout,
-                                                0, 1, &L.hme1Set, 0, nullptr);
-                        vkCmdPushConstants(L.searchCb, g_ctx.hme1Pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                           sizeof(p1), &p1);
-                        vkCmdDispatch(L.searchCb, g_ctx.blocks, 1, 1);
-                        barrierCompute(L.searchCb);
-                        PushConsts p2 = {(uint32_t)(g_ctx.fullSlotWords * srcSlot),
-                                         (uint32_t)(g_ctx.fullSlotWords * rs), (uint32_t)g_ctx.padW,
-                                         (uint32_t)g_ctx.padH, (uint32_t)g_ctx.cols,
-                                         (uint32_t)(RESULT_WORDS * g_ctx.blocks * sl)};
-                        vkCmdBindPipeline(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.fpPipe.pipe);
-                        vkCmdBindDescriptorSets(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.fpPipe.layout, 0,
-                                                1, &L.fpSet, 0, nullptr);
-                        vkCmdPushConstants(L.searchCb, g_ctx.fpPipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                           sizeof(p2), &p2);
-                        vkCmdDispatch(L.searchCb, g_ctx.blocks, 1, 1);
-                        if (sl + 1 < launched) barrierCompute(L.searchCb); // mv buffers reused next pair
+                        dw[sl * 8 + 0] = (uint32_t)(g_ctx.sSlotWords * srcSlot);
+                        dw[sl * 8 + 1] = (uint32_t)(g_ctx.sSlotWords * rs);
+                        dw[sl * 8 + 2] = (uint32_t)(g_ctx.qSlotWords * srcSlot);
+                        dw[sl * 8 + 3] = (uint32_t)(g_ctx.qSlotWords * rs);
+                        dw[sl * 8 + 4] = (uint32_t)(g_ctx.fullSlotWords * srcSlot);
+                        dw[sl * 8 + 5] = (uint32_t)(g_ctx.fullSlotWords * rs);
+                        dw[sl * 8 + 6] = (uint32_t)(RESULT_WORDS * g_ctx.blocks * sl);
+                        dw[sl * 8 + 7] = 0;
                     }
+                    uint32_t qw = (uint32_t)g_ctx.padW / 2, qh = (uint32_t)g_ctx.padH / 2;
+                    uint32_t sw = (uint32_t)g_ctx.padW / 4, shh = (uint32_t)g_ctx.padH / 4;
+                    PushConsts p0 = {sw, shh, (uint32_t)g_ctx.cols, (uint32_t)g_ctx.blocks, 0, 0};
+                    vkCmdBindPipeline(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme0Pipe.pipe);
+                    vkCmdBindDescriptorSets(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme0Pipe.layout, 0, 1,
+                                            &L.hme0Set, 0, nullptr);
+                    vkCmdPushConstants(L.searchCb, g_ctx.hme0Pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(p0), &p0);
+                    vkCmdDispatch(L.searchCb, g_ctx.blocks, launched, 1);
+                    barrierCompute(L.searchCb);
+                    PushConsts p1 = {qw, qh, (uint32_t)g_ctx.cols, (uint32_t)g_ctx.blocks, 0, 0};
+                    vkCmdBindPipeline(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme1Pipe.pipe);
+                    vkCmdBindDescriptorSets(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.hme1Pipe.layout, 0, 1,
+                                            &L.hme1Set, 0, nullptr);
+                    vkCmdPushConstants(L.searchCb, g_ctx.hme1Pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(p1), &p1);
+                    vkCmdDispatch(L.searchCb, g_ctx.blocks, launched, 1);
+                    barrierCompute(L.searchCb);
+                    PushConsts p2 = {(uint32_t)g_ctx.padW, (uint32_t)g_ctx.padH, (uint32_t)g_ctx.cols,
+                                     (uint32_t)g_ctx.blocks, 0, 0};
+                    vkCmdBindPipeline(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.fpPipe.pipe);
+                    vkCmdBindDescriptorSets(L.searchCb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ctx.fpPipe.layout, 0, 1,
+                                            &L.fpSet, 0, nullptr);
+                    vkCmdPushConstants(L.searchCb, g_ctx.fpPipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p2),
+                                       &p2);
+                    vkCmdDispatch(L.searchCb, g_ctx.blocks, launched, 1);
                     VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                     hb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
                     hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
