@@ -4110,8 +4110,7 @@ static stage_flag32 g_tf_report_registered;
 static void tf_cycles_report(void) {
     uint64_t proc_cycles = stage_process_ticks();
     fprintf(stderr,
-            "[TF_TIMER] temporal filtering cycles: %lld  process cycles: %llu  share: %.1f%%
-",
+            "[TF_TIMER] temporal filtering cycles: %lld  process cycles: %llu  share: %.1f%%\n",
             (long long)g_tf_cycles, (unsigned long long)proc_cycles,
             100.0 * (double)g_tf_cycles / (double)proc_cycles);
 }

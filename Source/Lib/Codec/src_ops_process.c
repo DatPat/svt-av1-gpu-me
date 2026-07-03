@@ -529,8 +529,7 @@ static stage_acc64  g_tpl_cycles;
 static stage_flag32 g_tpl_report_registered;
 static void tpl_cycles_report(void) {
     uint64_t proc_cycles = stage_process_ticks();
-    fprintf(stderr, "[TPL_TIMER] TPL dispenser cycles: %lld  process cycles: %llu  share: %.1f%%
-",
+    fprintf(stderr, "[TPL_TIMER] TPL dispenser cycles: %lld  process cycles: %llu  share: %.1f%%\n",
             (long long)g_tpl_cycles, (unsigned long long)proc_cycles,
             100.0 * (double)g_tpl_cycles / (double)proc_cycles);
 }

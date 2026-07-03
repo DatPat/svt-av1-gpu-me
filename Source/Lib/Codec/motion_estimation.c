@@ -3086,8 +3086,7 @@ static stage_flag32 g_me_report_registered;
 static void me_cycles_report(void) {
     uint64_t proc_cycles = stage_process_ticks();
     fprintf(stderr,
-            "[ME_TIMER] open-loop ME cycles: %lld  process cycles: %llu  share: %.1f%%
-",
+            "[ME_TIMER] open-loop ME cycles: %lld  process cycles: %llu  share: %.1f%%\n",
             (long long)g_me_cycles, (unsigned long long)proc_cycles,
             100.0 * (double)g_me_cycles / (double)proc_cycles);
 }
