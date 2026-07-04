@@ -4201,6 +4201,7 @@ static bool dimensions_require_8x8(const uint16_t aligned_width, const uint16_t 
 // the GPU-injected ME distortions or the stock CPU ME's own arrays, so it
 // needs no GPU to be active.
 #include <stdlib.h>
+#include <stdio.h>
 static int gpu_md_prune_boost(void) {
     static int boost = -1;
     if (boost < 0) {
@@ -4210,6 +4211,31 @@ static int gpu_md_prune_boost(void) {
     }
     return boost;
 }
+// MD feature-level override hook for speed/quality frontier experiments:
+// each SVT_MD_OVR_* env var, when set to a non-negative integer, replaces
+// the preset-derived level at the corresponding set_*_controls entry point
+// (covers every call site / pd pass uniformly).
+static int md_ovr_env(const char* name, int* cache) {
+    if (*cache == -2) {
+        const char* e = getenv(name);
+        *cache        = e ? atoi(e) : -1;
+    }
+    return *cache;
+}
+#define MD_OVR(envname, lvl_var)                       \
+    do {                                               \
+        static int md_ovr_cache = -2;                  \
+        static int md_log_cache = -2;                  \
+        static uint64_t md_seen = 0;                   \
+        int        md_ovr_v = md_ovr_env(envname, &md_ovr_cache); \
+        if (md_ovr_env("SVT_MD_LOG", &md_log_cache) > 0 && (lvl_var) < 64 && \
+            !(md_seen & (1ull << (lvl_var)))) {        \
+            md_seen |= 1ull << (lvl_var);              \
+            fprintf(stderr, "[MD_OVR] %s level=%d\n", envname, (int)(lvl_var)); \
+        }                                              \
+        if (md_ovr_v >= 0)                             \
+            (lvl_var) = (uint8_t)md_ovr_v;             \
+    } while (0)
 static void set_depth_removal_level_controls(PictureControlSet* pcs, ModeDecisionContext* ctx,
                                              uint8_t depth_removal_level) {
     DepthRemovalCtrls* depth_removal_ctrls = &ctx->depth_removal_ctrls;
@@ -4824,6 +4850,7 @@ static void md_sq_motion_search_controls(ModeDecisionContext* ctx, uint8_t md_sq
 static void md_subpel_me_controls(ModeDecisionContext* ctx, uint8_t md_subpel_me_level) {
     MdSubPelSearchCtrls* md_subpel_me_ctrls = &ctx->md_subpel_me_ctrls;
 
+    MD_OVR("SVT_MD_SUBPEL", md_subpel_me_level);
     switch (md_subpel_me_level) {
     case 0:
         md_subpel_me_ctrls->enabled = 0;
@@ -5161,6 +5188,7 @@ static void md_subpel_pme_controls(ModeDecisionContext* ctx, uint8_t md_subpel_p
 static void set_rdoq_controls(ModeDecisionContext* ctx, uint8_t rdoq_level) {
     RdoqCtrls* rdoq_ctrls = &ctx->rdoq_ctrls;
 
+    MD_OVR("SVT_MD_RDOQ", rdoq_level);
     switch (rdoq_level) {
     case 0:
         rdoq_ctrls->enabled = 0;
@@ -5312,6 +5340,7 @@ static void set_sq_txs_ctrls(ModeDecisionContext* ctx, uint8_t psq_txs_lvl) {
 void svt_aom_set_txt_controls(ModeDecisionContext* ctx, uint8_t txt_level) {
     TxtControls* txt_ctrls = &ctx->txt_ctrls;
 
+    MD_OVR("SVT_MD_TXT", txt_level);
     switch (txt_level) {
     case 0:
         txt_ctrls->enabled = 0;
@@ -6434,6 +6463,7 @@ void svt_aom_set_nsq_geom_ctrls(ModeDecisionContext* ctx, uint8_t nsq_geom_level
                                 uint8_t* allow_HV4, uint8_t* min_nsq_bsize) {
     NsqGeomCtrls  nsq_geom_ctrls_struct = {0};
     NsqGeomCtrls* nsq_geom_ctrls        = &nsq_geom_ctrls_struct;
+    MD_OVR("SVT_MD_NSQ_GEOM", nsq_geom_level);
     switch (nsq_geom_level) {
     case 0:
         nsq_geom_ctrls->enabled            = 0;
@@ -6488,6 +6518,7 @@ void svt_aom_set_nsq_geom_ctrls(ModeDecisionContext* ctx, uint8_t nsq_geom_level
 
 static void set_nsq_search_ctrls(PictureControlSet* pcs, ModeDecisionContext* ctx, uint8_t nsq_search_level) {
     bool me_dist_mod;
+    MD_OVR("SVT_MD_NSQ_SEARCH", nsq_search_level);
     // Whether or not to modulate the nsq_search_level using me-distortion
     if (pcs->slice_type == I_SLICE) {
         me_dist_mod = 0;
@@ -8759,6 +8790,7 @@ static void set_skip_sub_depth_ctrls(SkipSubDepthCtrls* skip_sub_depth_ctrls, ui
 void set_block_based_depth_refinement_controls(ModeDecisionContext* ctx, uint8_t block_based_depth_refinement_level) {
     DepthRefinementCtrls* depth_refinement_ctrls = &ctx->depth_refinement_ctrls;
 
+    MD_OVR("SVT_MD_DEPTH_REFINE", block_based_depth_refinement_level);
     switch (block_based_depth_refinement_level) {
     case 0:
         depth_refinement_ctrls->mode = PD0_DEPTH_NO_RESTRICTION;
