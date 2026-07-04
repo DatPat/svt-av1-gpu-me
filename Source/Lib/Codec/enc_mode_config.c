@@ -4218,7 +4218,17 @@ static int gpu_md_prune_boost(void) {
 static int md_ovr_env(const char* name, int* cache) {
     if (*cache == -2) {
         const char* e = getenv(name);
-        *cache        = e ? atoi(e) : -1;
+        if (e) {
+            // Empty or non-numeric values mean "unset", not level 0 — a
+            // container manager round-tripping env vars can easily leave
+            // SVT_MD_*="" behind, and atoi("") == 0 would silently force
+            // the lowest feature level.
+            char* end;
+            long  v = strtol(e, &end, 10);
+            *cache  = (end == e || v < 0 || v > 255) ? -1 : (int)v;
+        } else {
+            *cache = -1;
+        }
     }
     return *cache;
 }
